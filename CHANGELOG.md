@@ -7,6 +7,8 @@ Final releases will consolidate all intermediate changes in chronological order.
 
 ## UNRELEASED
 
+* feat(mistral): add support for locally hosted Voxtral endpoints
+* refactor(mistral): simplify config by removing redundant bearer_token parameter; api_key is used directly for both cloud and local endpoint authentication
 * feat(mistral): add Mistral/Voxtral STT provider support with batch and realtime streaming modes, VAD integration, and configuration via environment variables
 * feat(openai): add OpenAI STT provider support (official and compatible endpoints)
 * feat: add GladiaSttAgent provider and factory

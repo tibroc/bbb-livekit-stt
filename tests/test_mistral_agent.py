@@ -96,6 +96,9 @@ class TestMistralConfigDefaults:
     def test_min_confidence_final_defaults_to_0(self):
         assert MistralConfig().min_confidence_final == 0.0
 
+    def test_custom_endpoint_defaults_to_none(self):
+        assert MistralConfig().custom_endpoint is None
+
 
 class TestMistralConfigFromEnvironment:
     def test_model_from_environment(self, monkeypatch):
@@ -143,12 +146,26 @@ class TestMistralConfigFromEnvironment:
         config = MistralConfig()
         assert config.min_confidence_final == 0.5
 
+    def test_custom_endpoint_from_environment(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_CUSTOM_ENDPOINT", "http://localhost:8080")
+        config = MistralConfig()
+        assert config.custom_endpoint == "http://localhost:8080"
+
 
 class TestToSttKwargs:
     def test_includes_api_key(self):
         config = MistralConfig(api_key="test-key")
         kwargs = config.to_stt_kwargs()
         assert kwargs["api_key"] == "test-key"
+
+    def test_excludes_custom_endpoint(self):
+        """custom_endpoint is not passed as STT kwargs."""
+        config = MistralConfig(
+            api_key="key",
+            custom_endpoint="http://localhost:8080",
+        )
+        kwargs = config.to_stt_kwargs()
+        assert "custom_endpoint" not in kwargs
 
     def test_includes_model(self):
         config = MistralConfig(model="voxtral-small-latest")
@@ -328,6 +345,100 @@ class TestShouldEmit:
         event.alternatives = [alt1, alt2]
 
         assert agent._should_emit(event) is False
+
+
+class TestCustomEndpointClientCreation:
+    """Tests for custom Mistral client creation when custom_endpoint is set."""
+
+    def test_creates_custom_client_when_endpoint_set(self):
+        """When custom_endpoint is configured, a custom Mistral client is created."""
+        config = MistralConfig(
+            api_key="api-key",
+            custom_endpoint="http://localhost:8080",
+        )
+        with (
+            patch("providers.mistral.MistralSTT", spec=MistralSTT) as mock_stt_cls,
+            patch("mistralai.client.Mistral") as mock_mistral_cls,
+        ):
+            mock_client = MagicMock()
+            mock_mistral_cls.return_value = mock_client
+            MistralSttAgent(config)
+
+            # Mistral client should be created with api_key as bearer token
+            mock_mistral_cls.assert_called_once_with(
+                api_key="api-key",
+                server_url="http://localhost:8080",
+            )
+            # STT should receive the custom client
+            call_kwargs = mock_stt_cls.call_args
+            assert call_kwargs.kwargs.get("client") is mock_client
+
+    def test_uses_api_key_as_bearer_token(self):
+        """api_key is used directly as the bearer token for custom endpoints."""
+        config = MistralConfig(
+            api_key="my-api-key",
+            custom_endpoint="http://localhost:8080",
+        )
+        with (
+            patch("providers.mistral.MistralSTT", spec=MistralSTT),
+            patch("mistralai.client.Mistral") as mock_mistral_cls,
+        ):
+            MistralSttAgent(config)
+
+            mock_mistral_cls.assert_called_once_with(
+                api_key="my-api-key",
+                server_url="http://localhost:8080",
+            )
+
+    def test_no_custom_client_without_endpoint(self):
+        """When custom_endpoint is not set, no custom Mistral client is created."""
+        config = MistralConfig(api_key="api-key")
+        with (
+            patch("providers.mistral.MistralSTT", spec=MistralSTT) as mock_stt_cls,
+            patch("mistralai.client.Mistral") as mock_mistral_cls,
+        ):
+            MistralSttAgent(config)
+
+            # Mistral client should NOT be created
+            mock_mistral_cls.assert_not_called()
+            # STT should NOT receive a client kwarg
+            call_kwargs = mock_stt_cls.call_args
+            assert "client" not in call_kwargs.kwargs
+
+    def test_custom_client_excludes_api_key_from_stt_kwargs(self):
+        """When using a custom client, api_key should not be in STT kwargs."""
+        config = MistralConfig(
+            api_key="api-key",
+            custom_endpoint="http://localhost:8080",
+        )
+        with (
+            patch("providers.mistral.MistralSTT", spec=MistralSTT) as mock_stt_cls,
+            patch("mistralai.client.Mistral") as mock_mistral_cls,
+        ):
+            mock_mistral_cls.return_value = MagicMock()
+            MistralSttAgent(config)
+
+            call_kwargs = mock_stt_cls.call_args
+            assert "api_key" not in call_kwargs.kwargs
+
+    def test_custom_client_passes_model_and_other_kwargs(self):
+        """Custom client mode still passes model and other STT kwargs."""
+        config = MistralConfig(
+            api_key="api-key",
+            custom_endpoint="http://localhost:8080",
+            model="voxtral-mini-latest",
+            language="fr",
+        )
+        with (
+            patch("providers.mistral.MistralSTT", spec=MistralSTT) as mock_stt_cls,
+            patch("mistralai.client.Mistral") as mock_mistral_cls,
+        ):
+            mock_mistral_cls.return_value = MagicMock()
+            MistralSttAgent(config)
+
+            call_kwargs = mock_stt_cls.call_args.kwargs
+            assert call_kwargs["model"] == "voxtral-mini-latest"
+            assert call_kwargs["language"] == "fr"
 
 
 class TestVadLoading:

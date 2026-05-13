@@ -47,6 +47,9 @@ class MistralConfig(BaseSttConfig):
     min_confidence_final: float = field(
         default_factory=lambda: _get_float_env("MISTRAL_MIN_CONFIDENCE_FINAL", 0.0)
     )
+    custom_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("MISTRAL_CUSTOM_ENDPOINT")
+    )
 
     def to_stt_kwargs(self) -> dict:
         """Build kwargs for the MistralAI STT plugin constructor.
@@ -84,7 +87,22 @@ mistral_config = MistralConfig()
 class MistralSttAgent(BaseSttAgent):
     def __init__(self, config: MistralConfig):
         super().__init__(config)
-        self.stt = MistralSTT(**config.to_stt_kwargs())
+
+        stt_kwargs = config.to_stt_kwargs()
+
+        if config.custom_endpoint:
+            from mistralai.client import Mistral
+
+            custom_client = Mistral(
+                api_key=config.api_key,
+                server_url=config.custom_endpoint,
+            )
+            # api_key is already embedded in the custom client; remove it
+            # from stt_kwargs to avoid passing it twice.
+            stt_kwargs.pop("api_key", None)
+            stt_kwargs["client"] = custom_client
+
+        self.stt = MistralSTT(**stt_kwargs)
 
     def _create_stt_stream(self, locale: str) -> stt.SpeechStream:
         return self.stt.stream(language=locale)

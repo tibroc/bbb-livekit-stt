@@ -177,9 +177,23 @@ MISTRAL_MODEL=voxtral-mini-realtime-latest
 | `MISTRAL_MIN_CONFIDENCE_INTERIM` | Min confidence for interim | `0.0` |
 | `MISTRAL_MIN_CONFIDENCE_FINAL` | Min confidence for final | `0.0` |
 | `MISTRAL_CONTEXT_BIAS` | Custom vocabulary as JSON array | (none) |
+| `MISTRAL_CUSTOM_ENDPOINT` | Custom endpoint URL for local models | (none) |
 
 > **Note**: Language and context bias parameters only apply to batch models. Realtime
 > models use automatic language detection.
+
+### Using a locally hosted Voxtral model
+
+If you're running a local Mistral/Voxtral endpoint (e.g., via vLLM, Ollama, or similar):
+
+```bash
+STT_PROVIDER=mistral
+MISTRAL_CUSTOM_ENDPOINT=http://localhost:8080
+MISTRAL_API_KEY=your-bearer-token
+MISTRAL_MODEL=voxtral-mini-latest
+```
+
+`MISTRAL_API_KEY` is used as the bearer token for authentication with local endpoints.
 
 ### Development
 
