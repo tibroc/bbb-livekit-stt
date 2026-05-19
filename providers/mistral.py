@@ -116,7 +116,13 @@ def _make_vllm_realtime_transcription(sdk_configuration):
             merged = dict(parse_qsl(parsed.query, keep_blank_values=True))
             merged["model"] = model
             merged.update(dict(query_params))
-            return urlunparse(parsed._replace(query=urlencode(merged)))
+            result_url = urlunparse(parsed._replace(query=urlencode(merged)))
+
+            # Log the WebSocket URL for debugging
+            ws_url = result_url.replace("https://", "wss://").replace("http://", "ws://")
+            logging.debug(f"Voxtral WebSocket URL: {ws_url}")
+
+            return result_url
 
     return _VLLMRealtimeTranscription(sdk_configuration)
 
