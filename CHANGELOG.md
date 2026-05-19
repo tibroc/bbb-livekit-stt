@@ -7,6 +7,7 @@ Final releases will consolidate all intermediate changes in chronological order.
 
 ## UNRELEASED
 
+* fix(mistral): correct WebSocket path for locally hosted Voxtral endpoints (use /v1/realtime instead of /v1/audio/transcriptions/realtime)
 * feat(mistral): add support for locally hosted Voxtral endpoints
 * refactor(mistral): simplify config by removing redundant bearer_token parameter; api_key is used directly for both cloud and local endpoint authentication
 * feat(mistral): add Mistral/Voxtral STT provider support with batch and realtime streaming modes, VAD integration, and configuration via environment variables
