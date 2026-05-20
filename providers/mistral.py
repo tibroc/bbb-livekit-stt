@@ -111,7 +111,7 @@ async def _connect_vllm_ws(
     This function bypasses the SDK's ``RealtimeTranscription.connect()``
     entirely to avoid fragile subclass overrides and directly:
       1. Opens the WebSocket to ``<server_url>/v1/realtime?model=<model>``
-      2. Sends a ``session.update`` message to trigger the handshake
+      2. Sends a ``session.update`` message with the model field to trigger the handshake
       3. Waits for the ``session.created`` response
       4. Returns a ``RealtimeConnection`` the LiveKit plugin can use
     """
@@ -143,7 +143,11 @@ async def _connect_vllm_ws(
     try:
         # vLLM/voxtral servers require the client to send an initial
         # session.update before they reply with session.created.
-        session_update: dict = {"type": "session.update", "session": {}}
+        session_update: dict = {
+            "type": "session.update",
+            "model": model,
+            "session": {},
+        }
         if target_streaming_delay_ms is not None:
             session_update["session"]["target_streaming_delay_ms"] = (
                 target_streaming_delay_ms
