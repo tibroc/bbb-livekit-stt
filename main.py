@@ -148,6 +148,7 @@ async def entrypoint(ctx: JobContext):
                 end_time_adjusted,
                 result=True,
             )
+            logging.info(f"Transcript [{participant.identity}]: {text}")
 
     @agent.on("interim_transcript")
     async def on_interim_transcript(
@@ -238,6 +239,7 @@ async def entrypoint(ctx: JobContext):
                 end_time_adjusted,
                 result=False,
             )
+            logging.info(f"Transcript [{participant.identity}]: {text}")
 
     redis_listen_task = asyncio.create_task(redis_manager.listen(on_redis_message))
 

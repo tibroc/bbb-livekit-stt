@@ -104,7 +104,11 @@ class OpenAiRealtimeSttAgent(BaseSttAgent):
     def _create_stt_stream(self, locale: str) -> stt.SpeechStream:
         """Create an STT stream for the given locale."""
         stt_plugin = self._get_stt_plugin()
-        return stt_plugin.stream(language=locale)
+        stream = stt_plugin.stream(language=locale)
+        logging.debug(
+            f"Created STT stream for locale '{locale}' with model '{self.config.model}'"
+        )
+        return stream
 
     def _update_stream_locale(self, user_id: str, locale: str):
         """Update the locale for an active stream."""

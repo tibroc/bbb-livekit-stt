@@ -66,7 +66,7 @@ class RedisManager:
             await self.pub_client.publish(
                 self.TO_AKKA_APPS_CHANNEL, json.dumps(message)
             )
-            logging.debug(f"Published to Redis: {message}")
+            logging.info(f"Published to Redis: {message}")
         except Exception as e:
             logging.error(f"Failed to publish to Redis: {e}")
 

@@ -146,7 +146,7 @@ class BaseSttAgent(EventEmitter, ABC):
     ):
         if publication.source != rtc.TrackSource.SOURCE_MICROPHONE:
             logging.debug(
-                f"Skipping transcription for {participant.identity}'s track {track.sid} because it's not a microphone."
+                f"Skipping transcription for {participant.identity}'s track {track.sid} (source: {publication.source.name}) - not a microphone."
             )
             return
 
@@ -214,15 +214,32 @@ class BaseSttAgent(EventEmitter, ABC):
         async def forward_audio_task():
             try:
                 async for audio_event in audio_stream:
-                    stt_stream.push_frame(audio_event.frame)
+                    frame = audio_event.frame
+                    logging.debug(
+                        f"Received audio frame for {participant.identity} - sample_rate: {frame.sample_rate}, samples: {frame.samples_per_channel}, num_channels: {frame.num_channels}"
+                    )
+                    try:
+                        stt_stream.push_frame(frame)
+                        logging.debug(
+                            f"Pushed audio frame to STT stream for {participant.identity} - samples: {frame.samples_per_channel}"
+                        )
+                    except Exception as e:
+                        logging.error(
+                            f"Error pushing audio frame to STT stream for {participant.identity}: {e}",
+                            extra={"error_type": type(e).__name__},
+                        )
             finally:
                 stt_stream.flush()
+                logging.debug(f"Flushed STT stream for {participant.identity}")
 
         async def process_stt_task():
             async for event in stt_stream:
                 if not self._should_emit(event):
                     continue
                 if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    logging.info(
+                        f"Emitting event 'final_transcript' for {participant.identity}: {event.alternatives[0].text}"
+                    )
                     self.emit(
                         "final_transcript",
                         participant=participant,
@@ -233,6 +250,9 @@ class BaseSttAgent(EventEmitter, ABC):
                     event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT
                     and self.config.interim_results
                 ):
+                    logging.info(
+                        f"Emitting event 'interim_transcript' for {participant.identity}: {event.alternatives[0].text}"
+                    )
                     self.emit(
                         "interim_transcript",
                         participant=participant,
