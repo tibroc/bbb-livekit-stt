@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -97,11 +98,17 @@ def _make_vllm_realtime_transcription(sdk_configuration):
     ``/v1/audio/transcriptions/realtime``.  vLLM (and compatible servers)
     expose the endpoint at ``/v1/realtime`` instead.  This helper returns a
     ``RealtimeTranscription`` subclass whose ``_build_url`` uses the correct
-    path.
+    path and sends an initial session.update message to trigger the handshake.
     """
     from mistralai.client import utils as mistral_utils
     from mistralai.client.utils import generate_url
     from mistralai.extra.realtime import RealtimeTranscription
+    from mistralai.extra.realtime.connection import RealtimeConnection
+    from mistralai.extra.realtime.exceptions import RealtimeTranscriptionException
+    from mistralai.extra.realtime.transcription import _recv_handshake, _extract_error_message
+    from websockets.asyncio.client import connect
+    from mistralai.client.models import AudioFormat
+    from mistralai.client.utils import get_security, get_security_from_env
 
     class _VLLMRealtimeTranscription(RealtimeTranscription):
         def _build_url(self, model, *, server_url, query_params):
@@ -123,6 +130,107 @@ def _make_vllm_realtime_transcription(sdk_configuration):
             logging.debug(f"Voxtral WebSocket URL: {ws_url}")
 
             return result_url
+
+        async def connect(
+            self,
+            model: str,
+            audio_format=None,
+            target_streaming_delay_ms=None,
+            server_url=None,
+            timeout_ms=None,
+            http_headers=None,
+        ):
+            """Override connect to send session.update before handshake for vLLM/voxtral servers.
+            
+            vLLM servers require the client to send an initial session.update message
+            before sending the session.created handshake response.
+            """
+            if timeout_ms is None:
+                timeout_ms = self._sdk_config.timeout_ms
+
+            security = self._sdk_config.security
+            if security is not None and callable(security):
+                security = security()
+
+            resolved_security = get_security_from_env(security, None)
+            
+            headers: dict[str, str] = {}
+            query_params: dict[str, str] = {}
+
+            if resolved_security is not None:
+                security_headers, security_query = get_security(resolved_security)
+                headers |= security_headers
+                for key, values in security_query.items():
+                    if values:
+                        query_params[key] = values[-1]
+
+            if http_headers is not None:
+                headers |= dict(http_headers)
+
+            url = self._build_url(model, server_url=server_url, query_params=query_params)
+
+            parsed = urlparse(url)
+            if parsed.scheme == "https":
+                parsed = parsed._replace(scheme="wss")
+            elif parsed.scheme == "http":
+                parsed = parsed._replace(scheme="ws")
+            ws_url = urlunparse(parsed)
+            open_timeout = None if timeout_ms is None else timeout_ms / 1000.0
+            user_agent = self._sdk_config.user_agent
+
+            websocket = None
+            try:
+                websocket = await connect(
+                    ws_url,
+                    additional_headers=dict(headers),
+                    open_timeout=open_timeout,
+                    user_agent_header=user_agent,
+                )
+
+                # Send initial session.update to trigger server handshake response.
+                # This is required for vLLM/voxtral servers which won't send
+                # session.created until they receive this message.
+                session_update_payload = {}
+                if audio_format is not None:
+                    session_update_payload["audio_format"] = audio_format
+                if target_streaming_delay_ms is not None:
+                    session_update_payload["target_streaming_delay_ms"] = target_streaming_delay_ms
+                
+                # Send session.update message
+                session_update_message = {
+                    "type": "session.update",
+                    "session": session_update_payload if session_update_payload else {}
+                }
+                await websocket.send(json.dumps(session_update_message))
+                
+                # Now receive the handshake (session.created)
+                session, initial_events = await _recv_handshake(
+                    websocket, timeout_ms=timeout_ms
+                )
+                connection = RealtimeConnection(
+                    websocket=websocket,
+                    session=session,
+                    initial_events=initial_events,
+                )
+
+                # If audio_format or target_streaming_delay_ms was provided, send update again
+                # (this is the standard behavior for Mistral's official API)
+                if audio_format is not None or target_streaming_delay_ms is not None:
+                    await connection.update_session(
+                        audio_format,
+                        target_streaming_delay_ms=target_streaming_delay_ms,
+                    )
+
+                return connection
+
+            except RealtimeTranscriptionException:
+                if websocket is not None:
+                    await websocket.close()
+                raise
+            except Exception as exc:
+                if websocket is not None:
+                    await websocket.close()
+                raise RealtimeTranscriptionException(f"Failed to connect: {exc}") from exc
 
     return _VLLMRealtimeTranscription(sdk_configuration)
 
@@ -164,6 +272,18 @@ class MistralSttAgent(BaseSttAgent):
                 ) or getattr(cfg.client, "headers", None)
                 if client_headers:
                     http_headers = dict(client_headers)
+                
+                # Ensure Authorization header is included for vLLM/voxtral endpoints
+                # The Mistral SDK may not include it in the client headers for custom endpoints
+                if config.api_key and not (http_headers and "Authorization" in http_headers):
+                    if http_headers is None:
+                        http_headers = {}
+                    http_headers["Authorization"] = f"Bearer {config.api_key}"
+                
+                logging.debug(
+                    f"Connecting to voxtral WebSocket with headers: {list(http_headers.keys()) if http_headers else 'None'}"
+                )
+                
                 return await asyncio.wait_for(
                     vllm_rt.connect(
                         model=stt_instance._opts.model,
