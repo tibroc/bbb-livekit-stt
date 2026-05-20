@@ -90,6 +90,78 @@ class MistralConfig(BaseSttConfig):
 mistral_config = MistralConfig()
 
 
+async def _recv_vllm_handshake(
+    websocket,
+    *,
+    timeout_s: float,
+) -> tuple:
+    """Wait for ``session.created`` from a vLLM/voxtral WebSocket.
+
+    Unlike the Mistral SDK's ``_recv_handshake``, this implementation
+    logs every message received during the handshake phase so we can
+    diagnose protocol mismatches between vLLM versions.
+
+    Returns ``(session, initial_events)`` – the same shape the
+    ``RealtimeConnection`` constructor expects.
+    """
+    from mistralai.client.models import (
+        RealtimeTranscriptionSessionCreated,
+    )
+    from mistralai.extra.realtime.connection import (
+        UnknownRealtimeEvent,
+        parse_realtime_event,
+    )
+
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    initial_events: list = []
+
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("Timeout waiting for session.created from vLLM")
+
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        except asyncio.TimeoutError:
+            raise TimeoutError("Timeout waiting for session.created from vLLM")
+
+        text = (
+            raw.decode("utf-8", errors="replace")
+            if isinstance(raw, (bytes, bytearray))
+            else raw
+        )
+        logging.info("vLLM handshake message received: %s", text[:500])
+
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            logging.warning("vLLM handshake: invalid JSON: %s", exc)
+            initial_events.append(
+                UnknownRealtimeEvent(
+                    type=None, content=text, error=f"invalid JSON: {exc}"
+                )
+            )
+            continue
+
+        msg_type = payload.get("type") if isinstance(payload, dict) else None
+
+        if msg_type == "error":
+            error_msg = payload.get("error", {}).get("message", str(payload))
+            raise RuntimeError(f"vLLM returned error during handshake: {error_msg}")
+
+        event = parse_realtime_event(payload)
+        initial_events.append(event)
+
+        if isinstance(event, RealtimeTranscriptionSessionCreated):
+            logging.info("vLLM session.created received (request_id=%s)", event.session.request_id)
+            return event.session, initial_events
+
+        logging.debug(
+            "vLLM handshake: ignoring message type=%s while waiting for session.created",
+            msg_type,
+        )
+
+
 async def _connect_vllm_ws(
     server_url: str,
     model: str,
@@ -102,21 +174,17 @@ async def _connect_vllm_ws(
     """Open a WebSocket to a vLLM/voxtral realtime endpoint and perform handshake.
 
     The official Mistral SDK hardcodes the WebSocket path as
-    ``/v1/audio/transcriptions/realtime`` and expects the server to send a
-    ``session.created`` message immediately after the TCP handshake.  vLLM
-    (and compatible servers) expose the endpoint at ``/v1/realtime`` and may
-    require the client to send an initial ``session.update`` message before
-    the server responds with ``session.created``.
+    ``/v1/audio/transcriptions/realtime``.  vLLM (and compatible servers)
+    expose the endpoint at ``/v1/realtime``.
 
     This function bypasses the SDK's ``RealtimeTranscription.connect()``
-    entirely to avoid fragile subclass overrides and directly:
+    entirely and directly:
       1. Opens the WebSocket to ``<server_url>/v1/realtime?model=<model>``
-      2. Sends a ``session.update`` message with the model field to trigger the handshake
-      3. Waits for the ``session.created`` response
+      2. Waits for the server to send ``session.created``
+      3. Optionally sends ``session.update`` if streaming delay is configured
       4. Returns a ``RealtimeConnection`` the LiveKit plugin can use
     """
     from mistralai.extra.realtime.connection import RealtimeConnection
-    from mistralai.extra.realtime.transcription import _recv_handshake
     from websockets.asyncio.client import connect
 
     # Build the WebSocket URL
@@ -132,7 +200,11 @@ async def _connect_vllm_ws(
     if api_key and "Authorization" not in headers:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    logging.debug("Voxtral WebSocket URL: %s (headers: %s)", ws_url, list(headers.keys()))
+    logging.info(
+        "Connecting to vLLM WebSocket: %s (headers: %s)",
+        ws_url,
+        list(headers.keys()),
+    )
 
     websocket = await connect(
         ws_url,
@@ -141,32 +213,25 @@ async def _connect_vllm_ws(
     )
 
     try:
-        # vLLM/voxtral servers require the client to send an initial
-        # session.update before they reply with session.created.
-        session_update: dict = {
-            "type": "session.update",
-            "model": model,
-            "session": {},
-        }
-        if target_streaming_delay_ms is not None:
-            session_update["session"]["target_streaming_delay_ms"] = (
-                target_streaming_delay_ms
-            )
-        await websocket.send(json.dumps(session_update))
+        logging.info("WebSocket connected, waiting for session.created …")
 
-        logging.debug("Sent session.update, waiting for session.created …")
-
-        # Wait for the server to reply with session.created.
-        timeout_ms = int(timeout * 1000)
-        session, initial_events = await _recv_handshake(
-            websocket, timeout_ms=timeout_ms
+        session, initial_events = await _recv_vllm_handshake(
+            websocket, timeout_s=timeout
         )
 
-        return RealtimeConnection(
+        conn = RealtimeConnection(
             websocket=websocket,
             session=session,
             initial_events=initial_events,
         )
+
+        # Send session.update only after session.created, if needed.
+        if target_streaming_delay_ms is not None:
+            await conn.update_session(
+                target_streaming_delay_ms=target_streaming_delay_ms,
+            )
+
+        return conn
     except Exception:
         await websocket.close()
         raise
