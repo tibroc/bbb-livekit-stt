@@ -10,4 +10,11 @@ def create_agent(provider: str) -> BaseSttAgent:
         from providers.openai import OpenAiSttAgent, openai_config
 
         return OpenAiSttAgent(openai_config)
+    if provider == "openai-realtime":
+        from providers.openai_realtime import (
+            OpenAiRealtimeSttAgent,
+            openai_realtime_config,
+        )
+
+        return OpenAiRealtimeSttAgent(openai_realtime_config)
     raise ValueError(f"Unknown STT provider: {provider}")
