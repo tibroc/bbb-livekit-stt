@@ -66,6 +66,7 @@ class BaseSttAgent(EventEmitter, ABC):
         self.room.on("disconnected", self._on_disconnected)
         self.room.on("track_subscribed", self._on_track_subscribed)
         self.room.on("track_unsubscribed", self._on_track_unsubscribed)
+        self.room.on("track_published", self._on_track_published)
 
         try:
             await self._shutdown.wait()
@@ -95,7 +96,7 @@ class BaseSttAgent(EventEmitter, ABC):
 
         if not track:
             logging.warning(
-                f"Won't start transcription yet, no audio track found for {user_id}."
+                f"Audio track not yet available for {user_id}, waiting for track subscription."
             )
             return
 
@@ -165,6 +166,29 @@ class BaseSttAgent(EventEmitter, ABC):
             logging.debug(
                 f"Participant {participant.identity} subscribed with no active settings, skipping transcription."
             )
+
+    def _on_track_published(
+        self,
+        track: rtc.RemoteTrack,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        """Handle track_published event to catch tracks before subscription."""
+        if publication.source != rtc.TrackSource.SOURCE_MICROPHONE:
+            return
+
+        # Check if we have pending settings for this participant
+        if participant.identity in self.participant_settings:
+            settings = self.participant_settings[participant.identity]
+            locale = settings.get("locale")
+            provider = settings.get("provider")
+            if locale and provider:
+                logging.info(
+                    f"Track published for {participant.identity}, starting transcription"
+                )
+                self.start_transcription_for_user(
+                    participant.identity, locale, provider
+                )
 
     def _on_track_unsubscribed(
         self,
