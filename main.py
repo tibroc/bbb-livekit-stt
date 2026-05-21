@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 
 import nest_asyncio
 from dotenv import load_dotenv
@@ -14,6 +15,13 @@ from config import get_redacted_app_config, redis_config, stt_provider
 from utils import coerce_min_utterance_length_seconds, coerce_partial_utterances
 
 load_dotenv()
+
+# Configure logging level from environment variable
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 
 def _log_startup_configuration(stt_config):

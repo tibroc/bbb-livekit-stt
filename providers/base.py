@@ -146,7 +146,7 @@ class BaseSttAgent(EventEmitter, ABC):
     ):
         if publication.source != rtc.TrackSource.SOURCE_MICROPHONE:
             logging.debug(
-                f"Skipping transcription for {participant.identity}'s track {track.sid} (source: {publication.source.name}) - not a microphone."
+                f"Skipping transcription for {participant.identity}'s track {track.sid} (source: {rtc.TrackSource.Name(publication.source)}) - not a microphone."
             )
             return
 
