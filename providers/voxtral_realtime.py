@@ -130,40 +130,65 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
         open_time = time.time()
         self.open_time = open_time
-        audio_stream = rtc.AudioStream(track)
+        retry_delay = 1.0
 
         try:
-            async with self._get_http_session().ws_connect(
-                ws_url, headers=headers
-            ) as ws:
-                msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logging.error("Voxtral WS: expected text for session.created")
-                    return
-                data = json.loads(msg.data)
-                if data.get("type") != "session.created":
-                    logging.error(f"Voxtral WS: unexpected first message: {data}")
-                    return
-                logging.info(f"Voxtral WS session created for {participant.identity}")
+            while True:
+                audio_stream = rtc.AudioStream(track)
+                try:
+                    async with self._get_http_session().ws_connect(
+                        ws_url, headers=headers
+                    ) as ws:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            logging.error(
+                                "Voxtral WS: expected text for session.created"
+                            )
+                            return
+                        data = json.loads(msg.data)
+                        if data.get("type") != "session.created":
+                            logging.error(
+                                f"Voxtral WS: unexpected first message: {data}"
+                            )
+                            return
+                        logging.info(
+                            f"Voxtral WS session created for {participant.identity}"
+                        )
 
-                # vLLM expects model at top level of session.update
-                await ws.send_json(
-                    {"type": "session.update", "model": self.config.model}
-                )
+                        # vLLM expects model at top level of session.update
+                        await ws.send_json(
+                            {"type": "session.update", "model": self.config.model}
+                        )
 
-                await self._vad_loop(ws, audio_stream, participant, language, open_time)
+                        await self._vad_loop(
+                            ws, audio_stream, participant, language, open_time
+                        )
+                        return  # clean exit — audio stream finished normally
+
+                except asyncio.CancelledError:
+                    raise
+                except aiohttp.ClientError as e:
+                    logging.warning(
+                        f"Voxtral WS connection lost for {participant.identity} "
+                        f"({type(e).__name__}: {e}), reconnecting in {retry_delay:.0f}s"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+                except Exception as e:
+                    logging.error(
+                        f"Voxtral Realtime error for {participant.identity}: {e}",
+                        exc_info=True,
+                    )
+                    return
+                finally:
+                    await audio_stream.aclose()
 
         except asyncio.CancelledError:
             logging.info(
                 f"Voxtral Realtime transcription for {participant.identity} cancelled."
             )
-        except Exception as e:
-            logging.error(
-                f"Voxtral Realtime error for {participant.identity}: {e}", exc_info=True
-            )
         finally:
             self.processing_info.pop(participant.identity, None)
-            await audio_stream.aclose()
 
     async def _vad_loop(
         self,
