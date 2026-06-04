@@ -43,6 +43,11 @@ class VoxtralRealtimeConfig(BaseSttConfig):
     base_url: str | None = field(
         default_factory=lambda: os.getenv("OPENAI_REALTIME_BASE_URL", None)
     )
+    interim_results: bool = field(
+        default_factory=lambda: (
+            os.getenv("VOXTRAL_INTERIM_RESULTS", "true").lower() != "false"
+        )
+    )
 
 
 voxtral_realtime_config = VoxtralRealtimeConfig()
@@ -69,7 +74,9 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         raise NotImplementedError("VoxtralRealtime uses a custom pipeline")
 
     def _update_stream_locale(self, user_id: str, locale: str):
-        provider = self.participant_settings.get(user_id, {}).get("provider", "voxtral-realtime")
+        provider = self.participant_settings.get(user_id, {}).get(
+            "provider", "voxtral-realtime"
+        )
         self.stop_transcription_for_user(user_id)
         self.start_transcription_for_user(user_id, locale, provider)
 
@@ -80,7 +87,9 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
         participant = self._find_participant(user_id)
         if not participant:
-            logging.error(f"Cannot start transcription, participant {user_id} not found.")
+            logging.error(
+                f"Cannot start transcription, participant {user_id} not found."
+            )
             return
 
         track = self._find_audio_track(participant)
@@ -124,7 +133,9 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         audio_stream = rtc.AudioStream(track)
 
         try:
-            async with self._get_http_session().ws_connect(ws_url, headers=headers) as ws:
+            async with self._get_http_session().ws_connect(
+                ws_url, headers=headers
+            ) as ws:
                 msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logging.error("Voxtral WS: expected text for session.created")
@@ -136,12 +147,16 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 logging.info(f"Voxtral WS session created for {participant.identity}")
 
                 # vLLM expects model at top level of session.update
-                await ws.send_json({"type": "session.update", "model": self.config.model})
+                await ws.send_json(
+                    {"type": "session.update", "model": self.config.model}
+                )
 
                 await self._vad_loop(ws, audio_stream, participant, language, open_time)
 
         except asyncio.CancelledError:
-            logging.info(f"Voxtral Realtime transcription for {participant.identity} cancelled.")
+            logging.info(
+                f"Voxtral Realtime transcription for {participant.identity} cancelled."
+            )
         except Exception as e:
             logging.error(
                 f"Voxtral Realtime error for {participant.identity}: {e}", exc_info=True
@@ -158,55 +173,75 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         language: str,
         open_time: float,
     ):
-        speech_buffer: list[rtc.AudioFrame] = []
+        chunk_size = _TARGET_SAMPLE_RATE // 10 * 2  # 100 ms of int16
+        send_buffer_bytes = b""
         buffer_duration = 0.0
         silence_duration = 0.0
         was_speaking = False
         speech_start_time = 0.0
 
-        async def flush_segment(frames: list[rtc.AudioFrame], seg_start: float) -> None:
-            if not frames:
-                return
-            try:
-                combined = rtc.combine_audio_frames(frames)
-                pcm_bytes = _to_pcm16_16k(combined)
-
-                chunk_size = _TARGET_SAMPLE_RATE // 10 * 2  # 100 ms of int16
-                for i in range(0, len(pcm_bytes), chunk_size):
-                    await ws.send_json({
+        async def flush_segment(seg_start: float, tail_bytes: bytes) -> None:
+            """Send remaining audio, commit the segment, and collect the transcription."""
+            if tail_bytes:
+                await ws.send_json(
+                    {
                         "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(pcm_bytes[i : i + chunk_size]).decode(),
-                    })
+                        "audio": base64.b64encode(tail_bytes).decode(),
+                    }
+                )
 
-                # Start generation, then signal end of this segment
-                await ws.send_json({"type": "input_audio_buffer.commit"})
-                await ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+            await ws.send_json({"type": "input_audio_buffer.commit"})
+            await ws.send_json({"type": "input_audio_buffer.commit", "final": True})
 
-                text = await _collect_transcription(ws)
-                if text:
-                    seg_end = time.time() - open_time
-                    event = stt.SpeechEvent(
+            text = ""
+            try:
+                async for msg in _stream_transcription(ws, _TRANSCRIPTION_TIMEOUT_S):
+                    msg_type = msg.get("type")
+                    if msg_type == "transcription.delta":
+                        text += msg.get("delta", "")
+                        if text and self.config.interim_results:
+                            self.emit(
+                                "interim_transcript",
+                                participant=participant,
+                                event=stt.SpeechEvent(
+                                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                                    alternatives=[
+                                        stt.SpeechData(
+                                            text=text,
+                                            language=language,
+                                            start_time=seg_start,
+                                            end_time=time.time() - open_time,
+                                        )
+                                    ],
+                                ),
+                                open_time=open_time,
+                            )
+                    elif msg_type == "transcription.done":
+                        text = msg.get("text", text).strip()
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.error(
+                    f"Voxtral: error transcribing segment for {participant.identity}: {e}"
+                )
+
+            if text:
+                self.emit(
+                    "final_transcript",
+                    participant=participant,
+                    event=stt.SpeechEvent(
                         type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                         alternatives=[
                             stt.SpeechData(
                                 text=text,
                                 language=language,
                                 start_time=seg_start,
-                                end_time=seg_end,
+                                end_time=time.time() - open_time,
                             )
                         ],
-                    )
-                    self.emit(
-                        "final_transcript",
-                        participant=participant,
-                        event=event,
-                        open_time=open_time,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logging.error(
-                    f"Voxtral: error transcribing segment for {participant.identity}: {e}"
+                    ),
+                    open_time=open_time,
                 )
 
         async for audio_event in audio_stream:
@@ -219,32 +254,57 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             if is_speaking:
                 if not was_speaking:
                     speech_start_time = time.time() - open_time
-                speech_buffer.append(frame)
-                buffer_duration += frame_duration
-                silence_duration = 0.0
                 was_speaking = True
+                silence_duration = 0.0
+
+                send_buffer_bytes += _to_pcm16_16k(frame)
+                buffer_duration += frame_duration
+
+                while len(send_buffer_bytes) >= chunk_size:
+                    await ws.send_json(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(
+                                send_buffer_bytes[:chunk_size]
+                            ).decode(),
+                        }
+                    )
+                    send_buffer_bytes = send_buffer_bytes[chunk_size:]
 
                 if buffer_duration >= _MAX_BUFFER_DURATION_S:
-                    await flush_segment(speech_buffer[:], speech_start_time)
-                    speech_buffer.clear()
+                    await flush_segment(speech_start_time, send_buffer_bytes)
+                    send_buffer_bytes = b""
                     buffer_duration = 0.0
                     speech_start_time = time.time() - open_time
+
             elif was_speaking:
-                speech_buffer.append(frame)
+                send_buffer_bytes += _to_pcm16_16k(frame)
                 buffer_duration += frame_duration
                 silence_duration += frame_duration
+
+                while len(send_buffer_bytes) >= chunk_size:
+                    await ws.send_json(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(
+                                send_buffer_bytes[:chunk_size]
+                            ).decode(),
+                        }
+                    )
+                    send_buffer_bytes = send_buffer_bytes[chunk_size:]
 
                 if (
                     silence_duration >= _SILENCE_DURATION_S
                     or buffer_duration >= _MAX_BUFFER_DURATION_S
                 ):
-                    await flush_segment(speech_buffer[:], speech_start_time)
-                    speech_buffer.clear()
+                    await flush_segment(speech_start_time, send_buffer_bytes)
+                    send_buffer_bytes = b""
                     buffer_duration = 0.0
                     silence_duration = 0.0
                     was_speaking = False
 
-        await flush_segment(speech_buffer[:], speech_start_time)
+        if was_speaking:
+            await flush_segment(speech_start_time, send_buffer_bytes)
 
 
 def _to_pcm16_16k(frame: rtc.AudioFrame) -> bytes:
@@ -266,37 +326,38 @@ def _to_pcm16_16k(frame: rtc.AudioFrame) -> bytes:
     return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
 
-async def _collect_transcription(
+async def _stream_transcription(
     ws: aiohttp.ClientWebSocketResponse,
     timeout: float = _TRANSCRIPTION_TIMEOUT_S,
-) -> str:
-    """Read WebSocket messages until transcription.done and return the text."""
-    text = ""
-    try:
-        async def _read() -> str:
-            nonlocal text
-            while True:
-                msg = await ws.receive()
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    logging.warning("Voxtral WS closed while collecting transcription")
-                    return text
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                data = json.loads(msg.data)
-                msg_type = data.get("type")
-                if msg_type == "transcription.delta":
-                    text += data.get("delta", "")
-                elif msg_type == "transcription.done":
-                    return data.get("text", text).strip()
-                elif msg_type == "error":
-                    logging.error(f"Voxtral WS error event: {data}")
-                    return text
-
-        return await asyncio.wait_for(_read(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logging.warning("Voxtral: transcription timed out")
-        return text
+):
+    """Yield parsed message dicts from the WebSocket until transcription.done or timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logging.warning("Voxtral: transcription timed out")
+            return
+        try:
+            msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        except asyncio.TimeoutError:
+            logging.warning("Voxtral: transcription timed out")
+            return
+        if msg.type in (
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+        ):
+            logging.warning("Voxtral WS closed while collecting transcription")
+            return
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            continue
+        data = json.loads(msg.data)
+        msg_type = data.get("type")
+        if msg_type == "transcription.delta":
+            yield data
+        elif msg_type == "transcription.done":
+            yield data
+            return
+        elif msg_type == "error":
+            logging.error(f"Voxtral WS error event: {data}")
+            return
