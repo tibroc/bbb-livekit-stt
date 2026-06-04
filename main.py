@@ -1,3 +1,11 @@
+import os
+
+# Must happen before any prometheus_client import (including transitive ones from
+# livekit-agents), otherwise multiprocess mode is not activated in job subprocesses.
+if os.getenv("VOXTRAL_METRICS_PORT"):
+    _prom_dir = os.environ.setdefault("PROMETHEUS_MULTIPROC_DIR", "/tmp/bbb_stt_prom")
+    os.makedirs(_prom_dir, exist_ok=True)
+
 import asyncio
 import json
 import logging
@@ -255,5 +263,10 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
+    metrics_port = int(os.getenv("VOXTRAL_METRICS_PORT", "0"))
+    if metrics_port:
+        from metrics import start_metrics_server
+
+        start_metrics_server(metrics_port)
     opts = WorkerOptions(entrypoint_fnc=entrypoint)
     cli.run_app(opts)

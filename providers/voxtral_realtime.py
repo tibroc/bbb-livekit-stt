@@ -21,6 +21,7 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import stt
 
+import metrics
 from providers.base import BaseSttAgent, BaseSttConfig
 
 _SILENCE_THRESHOLD_RMS = float(os.getenv("VOXTRAL_SILENCE_THRESHOLD_RMS", "500"))
@@ -131,9 +132,11 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         open_time = time.time()
         self.open_time = open_time
         retry_delay = 1.0
+        metrics.ACTIVE_SESSIONS.inc()
 
         try:
             while True:
+                session_start = 0.0
                 audio_stream = rtc.AudioStream(track)
                 try:
                     async with self._get_http_session().ws_connect(
@@ -154,6 +157,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                         logging.info(
                             f"Voxtral WS session created for {participant.identity}"
                         )
+                        session_start = time.monotonic()
 
                         # vLLM expects model at top level of session.update
                         await ws.send_json(
@@ -168,6 +172,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 except asyncio.CancelledError:
                     raise
                 except aiohttp.ClientError as e:
+                    metrics.RECONNECTS_TOTAL.inc()
                     logging.warning(
                         f"Voxtral WS connection lost for {participant.identity} "
                         f"({type(e).__name__}: {e}), reconnecting in {retry_delay:.0f}s"
@@ -181,6 +186,10 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     )
                     return
                 finally:
+                    if session_start:
+                        metrics.SESSION_DURATION.observe(
+                            time.monotonic() - session_start
+                        )
                     await audio_stream.aclose()
 
         except asyncio.CancelledError:
@@ -188,6 +197,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 f"Voxtral Realtime transcription for {participant.identity} cancelled."
             )
         finally:
+            metrics.ACTIVE_SESSIONS.dec()
             self.processing_info.pop(participant.identity, None)
 
     async def _vad_loop(
@@ -205,7 +215,9 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         was_speaking = False
         speech_start_time = 0.0
 
-        async def flush_segment(seg_start: float, tail_bytes: bytes) -> None:
+        async def flush_segment(
+            seg_start: float, tail_bytes: bytes, audio_dur: float
+        ) -> None:
             """Send remaining audio, commit the segment, and collect the transcription."""
             if tail_bytes:
                 await ws.send_json(
@@ -218,11 +230,23 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             await ws.send_json({"type": "input_audio_buffer.commit"})
             await ws.send_json({"type": "input_audio_buffer.commit", "final": True})
 
+            commit_time = time.monotonic()
             text = ""
+            delta_count = 0
+            last_delta_time = 0.0
+            got_done = False
             try:
                 async for msg in _stream_transcription(ws, _TRANSCRIPTION_TIMEOUT_S):
                     msg_type = msg.get("type")
                     if msg_type == "transcription.delta":
+                        now = time.monotonic()
+                        if delta_count == 0:
+                            metrics.COMMIT_TO_FIRST_DELTA.observe(now - commit_time)
+                        else:
+                            metrics.DELTA_INTERVAL.observe(now - last_delta_time)
+                        last_delta_time = now
+                        delta_count += 1
+
                         text += msg.get("delta", "")
                         if text and self.config.interim_results:
                             self.emit(
@@ -242,6 +266,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                                 open_time=open_time,
                             )
                     elif msg_type == "transcription.done":
+                        got_done = True
                         text = msg.get("text", text).strip()
                         break
             except asyncio.CancelledError:
@@ -250,8 +275,15 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 logging.error(
                     f"Voxtral: error transcribing segment for {participant.identity}: {e}"
                 )
+                metrics.SEGMENTS_TOTAL.labels(outcome="error").inc()
+                return
+
+            metrics.COMMIT_TO_DONE.observe(time.monotonic() - commit_time)
+            metrics.DELTAS_PER_SEGMENT.observe(delta_count)
+            metrics.SEGMENT_AUDIO_DURATION.observe(audio_dur)
 
             if text:
+                metrics.SEGMENTS_TOTAL.labels(outcome="success").inc()
                 self.emit(
                     "final_transcript",
                     participant=participant,
@@ -268,6 +300,10 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     ),
                     open_time=open_time,
                 )
+            elif not got_done:
+                metrics.SEGMENTS_TOTAL.labels(outcome="timeout").inc()
+            else:
+                metrics.SEGMENTS_TOTAL.labels(outcome="empty").inc()
 
         async for audio_event in audio_stream:
             frame = audio_event.frame
@@ -297,7 +333,9 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     send_buffer_bytes = send_buffer_bytes[chunk_size:]
 
                 if buffer_duration >= _MAX_BUFFER_DURATION_S:
-                    await flush_segment(speech_start_time, send_buffer_bytes)
+                    await flush_segment(
+                        speech_start_time, send_buffer_bytes, buffer_duration
+                    )
                     send_buffer_bytes = b""
                     buffer_duration = 0.0
                     speech_start_time = time.time() - open_time
@@ -322,14 +360,16 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     silence_duration >= _SILENCE_DURATION_S
                     or buffer_duration >= _MAX_BUFFER_DURATION_S
                 ):
-                    await flush_segment(speech_start_time, send_buffer_bytes)
+                    await flush_segment(
+                        speech_start_time, send_buffer_bytes, buffer_duration
+                    )
                     send_buffer_bytes = b""
                     buffer_duration = 0.0
                     silence_duration = 0.0
                     was_speaking = False
 
         if was_speaking:
-            await flush_segment(speech_start_time, send_buffer_bytes)
+            await flush_segment(speech_start_time, send_buffer_bytes, buffer_duration)
 
 
 def _to_pcm16_16k(frame: rtc.AudioFrame) -> bytes:
