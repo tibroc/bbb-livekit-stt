@@ -29,13 +29,17 @@ _SILENCE_DURATION_S = float(os.getenv("VOXTRAL_SILENCE_DURATION_S", "0.6"))
 _MAX_BUFFER_DURATION_S = float(os.getenv("VOXTRAL_MAX_BUFFER_DURATION_S", "8.0"))
 _TARGET_SAMPLE_RATE = int(os.getenv("VOXTRAL_TARGET_SAMPLE_RATE", "16000"))
 _TRANSCRIPTION_TIMEOUT_S = float(os.getenv("VOXTRAL_TRANSCRIPTION_TIMEOUT_S", "10.0"))
+# Commit audio to the server every N seconds during continuous speech so text
+# appears while the speaker is still talking.  The commit and audio streaming
+# run concurrently so the audio loop is never blocked.  Set to 0 to disable.
+_PROGRESSIVE_FLUSH_INTERVAL_S = float(
+    os.getenv("VOXTRAL_PROGRESSIVE_FLUSH_INTERVAL_S", "2.5")
+)
 
 
 @dataclass
 class VoxtralRealtimeConfig(BaseSttConfig):
-    api_key: str | None = field(
-        default_factory=lambda: os.getenv("VOXTRAL_API_KEY")
-    )
+    api_key: str | None = field(default_factory=lambda: os.getenv("VOXTRAL_API_KEY"))
     model: str = field(
         default_factory=lambda: os.getenv(
             "VOXTRAL_MODEL", "mistralai/Voxtral-Mini-4B-Realtime-2602"
@@ -213,32 +217,50 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         buffer_duration = 0.0
         silence_duration = 0.0
         was_speaking = False
-        speech_start_time = 0.0
+        # flush_start_time is reset to the current time after every commit so that
+        # each chunk gets its own start_time → distinct transcriptId in BBB.
+        # Progressive and tail chunks are therefore independent caption lines rather
+        # than one overwriting the other.
+        flush_start_time = 0.0
+        # Tracks the in-flight background transcription task for progressive flushes.
+        # Only one may be outstanding at a time to avoid concurrent WS reads.
+        prog_task: asyncio.Task | None = None
+        # Set to True by _collect_transcript the moment it reads transcription.done
+        # from the WS buffer.  Checked after prog_task cancellation to decide
+        # whether the final flush must skip one done event in the stream.
+        prog_done_consumed = False
 
-        async def flush_segment(
-            seg_start: float, tail_bytes: bytes, audio_dur: float
+        async def _collect_transcript(
+            seg_start: float,
+            audio_dur: float,
+            is_final: bool,
+            skip_done_count: int = 0,
         ) -> None:
-            """Send remaining audio, commit the segment, and collect the transcription."""
-            if tail_bytes:
-                await ws.send_json(
-                    {
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(tail_bytes).decode(),
-                    }
-                )
+            """Read transcription events from the WS and emit them.
 
-            await ws.send_json({"type": "input_audio_buffer.commit"})
-            await ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+            Called as a background task for progressive flushes so audio streaming
+            is never blocked.  Called with await for the final silence flush.
+            Emits INTERIM events for progressive chunks, FINAL for the last one.
 
+            skip_done_count: discard this many transcription.done events (and all
+            deltas preceding them) before treating the next one as ours.  Set to 1
+            when a progressive commit was cancelled and the final commit was sent
+            immediately after — the server responds to both in order, so we skip
+            the leftover progressive response and take the final one.
+            """
+            nonlocal prog_done_consumed
             commit_time = time.monotonic()
             text = ""
             delta_count = 0
             last_delta_time = 0.0
             got_done = False
+            skip_remaining = skip_done_count
             try:
                 async for msg in _stream_transcription(ws, _TRANSCRIPTION_TIMEOUT_S):
                     msg_type = msg.get("type")
                     if msg_type == "transcription.delta":
+                        if skip_remaining > 0:
+                            continue
                         now = time.monotonic()
                         if delta_count == 0:
                             metrics.COMMIT_TO_FIRST_DELTA.observe(now - commit_time)
@@ -266,6 +288,11 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                                 open_time=open_time,
                             )
                     elif msg_type == "transcription.done":
+                        if skip_remaining > 0:
+                            skip_remaining -= 1
+                            text = ""
+                            continue
+                        prog_done_consumed = True
                         got_done = True
                         text = msg.get("text", text).strip()
                         break
@@ -284,6 +311,10 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
             if text:
                 metrics.SEGMENTS_TOTAL.labels(outcome="success").inc()
+                # Every completed chunk is emitted as FINAL so that each gets its
+                # own committed caption in BBB.  Progressive and tail chunks have
+                # distinct flush_start_time values → distinct transcriptIds → they
+                # appear as separate caption lines rather than one replacing the other.
                 self.emit(
                     "final_transcript",
                     participant=participant,
@@ -305,6 +336,48 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             else:
                 metrics.SEGMENTS_TOTAL.labels(outcome="empty").inc()
 
+        async def _send_commit(tail_bytes: bytes, final: bool) -> None:
+            """Send tail audio + commit message(s). Writes only — no WS reads."""
+            if tail_bytes:
+                await ws.send_json(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(tail_bytes).decode(),
+                    }
+                )
+            await ws.send_json({"type": "input_audio_buffer.commit"})
+            if final:
+                await ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+
+        async def _cancel_prog_task() -> int:
+            """Cancel the in-flight progressive task and return skip_done_count.
+
+            Awaits the task after cancelling so it is fully stopped before the
+            caller touches ws.receive() again — aiohttp forbids concurrent reads.
+            The wait is near-instant: CancelledError propagates on the next event
+            loop cycle when the task is blocked inside asyncio.wait_for(ws.receive()).
+
+            Returns 1 if transcription.done for the progressive commit has NOT yet
+            been read from the WS buffer (final flush must skip past it).
+            Returns 0 if the buffer is already clean.
+            """
+            nonlocal prog_task, prog_done_consumed
+            if prog_task and not prog_task.done():
+                prog_task.cancel()
+                try:
+                    await prog_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                prog_task = None
+                # prog_done_consumed is set synchronously the moment _collect_transcript
+                # reads transcription.done — no await between that set and here, so
+                # the value is authoritative.
+                skip = 0 if prog_done_consumed else 1
+                prog_done_consumed = False
+                return skip
+            prog_done_consumed = False
+            return 0
+
         async for audio_event in audio_stream:
             frame = audio_event.frame
             samples = np.frombuffer(frame.data, dtype=np.int16)
@@ -314,7 +387,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
             if is_speaking:
                 if not was_speaking:
-                    speech_start_time = time.time() - open_time
+                    flush_start_time = time.time() - open_time
                 was_speaking = True
                 silence_duration = 0.0
 
@@ -332,13 +405,36 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     )
                     send_buffer_bytes = send_buffer_bytes[chunk_size:]
 
-                if buffer_duration >= _MAX_BUFFER_DURATION_S:
-                    await flush_segment(
-                        speech_start_time, send_buffer_bytes, buffer_duration
+                if (
+                    _PROGRESSIVE_FLUSH_INTERVAL_S > 0
+                    and buffer_duration >= _PROGRESSIVE_FLUSH_INTERVAL_S
+                    and (prog_task is None or prog_task.done())
+                ):
+                    prog_done_consumed = False
+                    await _send_commit(send_buffer_bytes, final=False)
+                    prog_task = asyncio.create_task(
+                        _collect_transcript(
+                            flush_start_time, buffer_duration, is_final=False
+                        )
                     )
                     send_buffer_bytes = b""
                     buffer_duration = 0.0
-                    speech_start_time = time.time() - open_time
+                    flush_start_time = time.time() - open_time
+                elif buffer_duration >= _MAX_BUFFER_DURATION_S:
+                    skip = await _cancel_prog_task()
+                    prog_done_consumed = False
+                    await _send_commit(send_buffer_bytes, final=False)
+                    prog_task = asyncio.create_task(
+                        _collect_transcript(
+                            flush_start_time,
+                            buffer_duration,
+                            is_final=False,
+                            skip_done_count=skip,
+                        )
+                    )
+                    send_buffer_bytes = b""
+                    buffer_duration = 0.0
+                    flush_start_time = time.time() - open_time
 
             elif was_speaking:
                 send_buffer_bytes += _to_pcm16_16k(frame)
@@ -360,16 +456,30 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     silence_duration >= _SILENCE_DURATION_S
                     or buffer_duration >= _MAX_BUFFER_DURATION_S
                 ):
-                    await flush_segment(
-                        speech_start_time, send_buffer_bytes, buffer_duration
+                    skip = await _cancel_prog_task()
+                    await _send_commit(send_buffer_bytes, final=True)
+                    await _collect_transcript(
+                        flush_start_time,
+                        buffer_duration,
+                        is_final=True,
+                        skip_done_count=skip,
                     )
                     send_buffer_bytes = b""
                     buffer_duration = 0.0
                     silence_duration = 0.0
                     was_speaking = False
+                    flush_start_time = 0.0
+                    prog_task = None
 
         if was_speaking:
-            await flush_segment(speech_start_time, send_buffer_bytes, buffer_duration)
+            skip = await _cancel_prog_task()
+            await _send_commit(send_buffer_bytes, final=True)
+            await _collect_transcript(
+                flush_start_time,
+                buffer_duration,
+                is_final=True,
+                skip_done_count=skip,
+            )
 
 
 def _to_pcm16_16k(frame: rtc.AudioFrame) -> bytes:
