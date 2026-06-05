@@ -24,24 +24,24 @@ from livekit.agents import stt
 from providers.base import BaseSttAgent, BaseSttConfig
 
 _SILENCE_THRESHOLD_RMS = float(os.getenv("VOXTRAL_SILENCE_THRESHOLD_RMS", "500"))
-_SILENCE_DURATION_S = float(os.getenv("VOXTRAL_SILENCE_DURATION_S", "0.8"))
-_MAX_BUFFER_DURATION_S = float(os.getenv("VOXTRAL_MAX_BUFFER_DURATION_S", "12.0"))
+_SILENCE_DURATION_S = float(os.getenv("VOXTRAL_SILENCE_DURATION_S", "0.6"))
+_MAX_BUFFER_DURATION_S = float(os.getenv("VOXTRAL_MAX_BUFFER_DURATION_S", "8.0"))
 _TARGET_SAMPLE_RATE = int(os.getenv("VOXTRAL_TARGET_SAMPLE_RATE", "16000"))
-_TRANSCRIPTION_TIMEOUT_S = float(os.getenv("VOXTRAL_TRANSCRIPTION_TIMEOUT_S", "30.0"))
+_TRANSCRIPTION_TIMEOUT_S = float(os.getenv("VOXTRAL_TRANSCRIPTION_TIMEOUT_S", "10.0"))
 
 
 @dataclass
 class VoxtralRealtimeConfig(BaseSttConfig):
     api_key: str | None = field(
-        default_factory=lambda: os.getenv("OPENAI_REALTIME_API_KEY")
+        default_factory=lambda: os.getenv("VOXTRAL_API_KEY")
     )
     model: str = field(
         default_factory=lambda: os.getenv(
-            "OPENAI_REALTIME_MODEL", "mistralai/Voxtral-Mini-4B-Realtime-2602"
+            "VOXTRAL_MODEL", "mistralai/Voxtral-Mini-4B-Realtime-2602"
         )
     )
     base_url: str | None = field(
-        default_factory=lambda: os.getenv("OPENAI_REALTIME_BASE_URL", None)
+        default_factory=lambda: os.getenv("VOXTRAL_BASE_URL", None)
     )
     interim_results: bool = field(
         default_factory=lambda: (
