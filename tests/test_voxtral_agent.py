@@ -12,7 +12,6 @@ from providers.voxtral_realtime import (
     VoxtralRealtimeConfig,
     VoxtralRealtimeSttAgent,
     _SILENCE_THRESHOLD_RMS,
-    _stream_transcription,
     _to_pcm16_16k,
 )
 
@@ -54,12 +53,6 @@ def _text_ws_msg(data: dict) -> MagicMock:
     msg = MagicMock()
     msg.type = aiohttp.WSMsgType.TEXT
     msg.data = json.dumps(data)
-    return msg
-
-
-def _close_ws_msg() -> MagicMock:
-    msg = MagicMock()
-    msg.type = aiohttp.WSMsgType.CLOSED
     return msg
 
 
@@ -191,83 +184,6 @@ class TestToPcm16_16k:
         result = _to_pcm16_16k(frame)
         out = np.frombuffer(result, dtype=np.int16)
         assert all(-32768 <= s <= 32767 for s in out)
-
-
-# ── _stream_transcription async generator ─────────────────────────────────────
-
-
-class TestStreamTranscription:
-    async def test_yields_delta_then_done(self):
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[
-            _text_ws_msg({"type": "transcription.delta", "delta": "hello "}),
-            _text_ws_msg({"type": "transcription.done", "text": "hello world"}),
-        ])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert len(msgs) == 2
-        assert msgs[0]["type"] == "transcription.delta"
-        assert msgs[0]["delta"] == "hello "
-        assert msgs[1]["type"] == "transcription.done"
-        assert msgs[1]["text"] == "hello world"
-
-    async def test_stops_immediately_after_done(self):
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[
-            _text_ws_msg({"type": "transcription.done", "text": "hi"}),
-            _text_ws_msg({"type": "transcription.delta", "delta": "extra"}),
-        ])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert len(msgs) == 1
-        assert msgs[0]["type"] == "transcription.done"
-
-    async def test_stops_on_ws_close(self):
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[_close_ws_msg()])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert msgs == []
-
-    async def test_skips_non_text_messages(self):
-        binary = MagicMock()
-        binary.type = aiohttp.WSMsgType.BINARY
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[
-            binary,
-            _text_ws_msg({"type": "transcription.done", "text": "ok"}),
-        ])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert len(msgs) == 1
-        assert msgs[0]["type"] == "transcription.done"
-
-    async def test_negative_timeout_returns_immediately(self, caplog):
-        """Negative timeout → remaining ≤ 0 on first check → generator exits."""
-        ws = MagicMock()
-        ws.receive = AsyncMock()
-        msgs = [m async for m in _stream_transcription(ws, timeout=-1.0)]
-        assert msgs == []
-        ws.receive.assert_not_called()
-        assert "timed out" in caplog.text
-
-    async def test_stops_and_logs_on_error_event(self, caplog):
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[
-            _text_ws_msg({"type": "error", "message": "something went wrong"}),
-        ])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert msgs == []
-        assert "error" in caplog.text.lower()
-
-    async def test_multiple_deltas_before_done(self):
-        ws = MagicMock()
-        ws.receive = AsyncMock(side_effect=[
-            _text_ws_msg({"type": "transcription.delta", "delta": "one "}),
-            _text_ws_msg({"type": "transcription.delta", "delta": "two "}),
-            _text_ws_msg({"type": "transcription.delta", "delta": "three"}),
-            _text_ws_msg({"type": "transcription.done", "text": "one two three"}),
-        ])
-        msgs = [m async for m in _stream_transcription(ws, timeout=5.0)]
-        assert len(msgs) == 4
-        deltas = [m for m in msgs if m["type"] == "transcription.delta"]
-        assert len(deltas) == 3
 
 
 # ── start_transcription_for_user ───────────────────────────────────────────────
@@ -430,7 +346,13 @@ class TestVadLoop:
 
         mock_ws = AsyncMock()
         mock_ws.receive = AsyncMock(side_effect=all_ws)
-        mock_ws.send_json = AsyncMock()
+        # Use a real async function so that awaiting send_json actually yields
+        # to the event loop — this gives the concurrent _reader() task a chance
+        # to process incoming WS messages while the writer is still sending.
+        async def _send_json(_data):
+            await asyncio.sleep(0)
+
+        mock_ws.send_json = _send_json
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=mock_ws)
         cm.__aexit__ = AsyncMock(return_value=False)

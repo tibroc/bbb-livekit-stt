@@ -187,16 +187,7 @@ async def entrypoint(ctx: JobContext):
             ):
                 logging.debug(
                     f"Discarding interim transcript for {participant.identity}: too short "
-                    f"({utterance_duration_seconds:.3f}s <= {min_utterance_length}s).",
-                    extra={
-                        "utterance_duration_seconds": utterance_duration_seconds,
-                        "min_utterance_length": min_utterance_length,
-                        "open_time": open_time,
-                        "start_time": alternative.start_time,
-                        "end_time": alternative.end_time,
-                        "start_time_adjusted": start_time_adjusted,
-                        "end_time_adjusted": end_time_adjusted,
-                    },
+                    f"({utterance_duration_seconds:.3f}s <= {min_utterance_length}s)."
                 )
                 continue
 
