@@ -1535,6 +1535,40 @@ class TestTranslationFanout:
         langs = [kw["event"].alternatives[0].language for kw in final]
         assert langs == ["de"], "a failed batch must not crash or drop the original"
 
+    async def test_source_language_is_excluded_from_targets(self):
+        """A target equal to the speaker's language must be dropped: its
+        result would share the original's language AND start_time — the same
+        BBB transcriptId — and overwrite the real transcript with an NMT
+        round-trip of itself."""
+        batch = AsyncMock(return_value=[])
+        agent = self._make_translating_agent(batch, targets=("de", "en"))
+        await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Hallo"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Hallo"}),
+            ],
+        )
+        await _wait_until(lambda: batch.call_count >= 1)
+
+        assert batch.call_count == 1
+        assert batch.call_args[0][0][0]["tgts"] == ["en"], (
+            "the source language must be filtered out of tgts"
+        )
+
+    async def test_only_source_language_target_skips_the_call(self):
+        batch = AsyncMock(return_value=[])
+        agent = self._make_translating_agent(batch, targets=("de",))
+        await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Hallo"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Hallo"}),
+            ],
+        )
+        await asyncio.sleep(0.05)
+        assert batch.call_count == 0
+
     async def test_empty_segment_is_not_fanned_out(self):
         batch = AsyncMock(return_value=[])
         agent = self._make_translating_agent(batch)

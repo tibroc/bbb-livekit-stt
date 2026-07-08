@@ -25,6 +25,7 @@ Final releases will consolidate all intermediate changes in chronological order.
 * fix(voxtral): request greedy decoding (temperature 0.0) in session.update
 * feat(voxtral): translate finalized transcripts via a dedicated NMT service
 * feat: optional JSONL segment logging (VOXTRAL_SEGMENT_LOG) for the translation golden set
+* fix: move segment-log writes off the event loop, never fan out to the source language
 * docs: document the Voxtral Realtime provider and Python 3.11 requirement in README
 * build: add GitHub Actions workflow for running tests
 ## v0.2.0

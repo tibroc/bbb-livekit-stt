@@ -11,6 +11,7 @@ from livekit import rtc
 from redis_manager import RedisManager
 from providers import create_agent
 from config import get_redacted_app_config, redis_config, stt_provider
+from segment_logger import make_segment_logger
 from utils import coerce_min_utterance_length_seconds, coerce_partial_utterances
 
 load_dotenv()
@@ -238,6 +239,12 @@ async def entrypoint(ctx: JobContext):
                 end_time_adjusted,
                 result=False,
             )
+
+    # Optional: dump finalized original-language segments to JSONL for building
+    # the translation golden set (no-op unless VOXTRAL_SEGMENT_LOG is set).
+    segment_logger = make_segment_logger(agent)
+    if segment_logger:
+        agent.on("final_transcript", segment_logger)
 
     redis_listen_task = asyncio.create_task(redis_manager.listen(on_redis_message))
 

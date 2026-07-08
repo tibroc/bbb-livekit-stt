@@ -400,7 +400,15 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             its own task so the HTTP round trip never blocks the reader; a
             failed batch or per-pair error simply yields no FINAL for that
             target and never affects the original or other targets."""
-            targets = self.config.translation_target_languages
+            # Never "translate" into the speaker's own language: the result
+            # would carry the original's language and start_time and therefore
+            # its BBB transcriptId, overwriting the real transcript with an
+            # NMT round-trip of itself.
+            targets = [
+                t for t in self.config.translation_target_languages if t != language
+            ]
+            if not targets:
+                return
             item_id = f"{participant.identity}-{int(start_time * 1000)}"
             try:
                 results = await self._translate_batch(
