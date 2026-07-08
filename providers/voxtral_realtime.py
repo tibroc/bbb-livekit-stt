@@ -26,6 +26,7 @@ from livekit.agents import stt
 from livekit.agents import vad as agents_vad
 from livekit.plugins import silero
 
+from config import _get_bool_env, _get_list_env, _get_map_env
 from providers.base import BaseSttAgent, BaseSttConfig
 
 # Safety cap on a single streaming request's length. Only hit during pure
@@ -58,6 +59,18 @@ _RETRY_DELAY_MAX_S = 30.0
 # transcription.done of the final segment before tearing the reader down;
 # cancelling it immediately would drop the tail utterance's FINAL.
 _FINAL_DRAIN_TIMEOUT_S = 3.0
+# Client-side ceiling for a /translate_batch call. The NMT service budgets
+# 300 ms server-side; the contract says treat > 500 ms as a skip. Translations
+# are best-effort FINALs, so a slow/failed call is dropped, never retried.
+_TRANSLATION_TIMEOUT_S = 0.5
+
+# Default provider-language-code → BBB-locale map, shared shape with Gladia so
+# main.py routes translated FINALs (whose SpeechData.language is a target code)
+# to the right per-locale BBB transcript track. Keys are ISO 639-1.
+DEFAULT_TRANSLATION_LANG_MAP = (
+    "de:de-DE,en:en-US,es:es-ES,fr:fr-FR,hi:hi-IN,"
+    "it:it-IT,ja:ja-JP,pt:pt-BR,ru:ru-RU,zh:zh-CN"
+)
 
 
 @dataclass
@@ -74,6 +87,26 @@ class VoxtralRealtimeConfig(BaseSttConfig):
     interim_results: bool = field(
         default_factory=lambda: (
             os.getenv("VOXTRAL_INTERIM_RESULTS", "true").lower() != "false"
+        )
+    )
+
+    # Translation (Option B: client-side fan-out to a dedicated NMT service).
+    translation_enabled: bool = field(
+        default_factory=lambda: bool(
+            _get_bool_env("VOXTRAL_TRANSLATION_ENABLED", False)
+        )
+    )
+    translation_target_languages: list[str] = field(
+        default_factory=lambda: (
+            _get_list_env("VOXTRAL_TRANSLATION_TARGET_LANGUAGES", []) or []
+        )
+    )
+    translation_service_url: str | None = field(
+        default_factory=lambda: os.getenv("VOXTRAL_TRANSLATION_SERVICE_URL", None)
+    )
+    translation_lang_map: dict[str, str] = field(
+        default_factory=lambda: _get_map_env(
+            "VOXTRAL_TRANSLATION_LANG_MAP", DEFAULT_TRANSLATION_LANG_MAP
         )
     )
 
@@ -96,6 +129,11 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 "VOXTRAL_BASE_URL is required for the voxtral-realtime provider "
                 "(the URL of your vLLM server, e.g. https://your-server:8000/v1)."
             )
+        if config.translation_enabled and not config.translation_service_url:
+            raise ValueError(
+                "VOXTRAL_TRANSLATION_SERVICE_URL is required when "
+                "VOXTRAL_TRANSLATION_ENABLED is set (the URL of the NMT service)."
+            )
         self._http_session: aiohttp.ClientSession | None = None
         self._vad: agents_vad.VAD = vad or silero.VAD.load(
             min_silence_duration=_VAD_MIN_SILENCE_S,
@@ -109,10 +147,34 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             )
         return self._http_session
 
+    @property
+    def translation_lang_map(self) -> dict[str, str]:
+        return self.config.translation_lang_map
+
     def _build_ws_url(self) -> str:
         base = self.config.base_url.rstrip("/")
         base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         return f"{base}/realtime?intent=transcription"
+
+    async def _translate_batch(self, items: list[dict]) -> list[dict]:
+        """POST one batch to the NMT service and return its flat results list.
+
+        Contract: request {"items":[{"id","text","src","tgts":[...]}]} →
+        {"results":[{"id","tgt","text"} | {"id","tgt","error"}]}, one result
+        per (id, tgt). Failed pairs carry an "error"; the caller skips those.
+        Raises on transport/timeout/HTTP error — the caller treats that as
+        "no translations for this segment" (best-effort, never fatal).
+        """
+        url = f"{self.config.translation_service_url.rstrip('/')}/translate_batch"
+        session = self._get_http_session()
+        async with session.post(
+            url,
+            json={"items": items},
+            timeout=aiohttp.ClientTimeout(total=_TRANSLATION_TIMEOUT_S),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        return data.get("results", [])
 
     def _create_stt_stream(self, locale: str) -> stt.SpeechStream:
         raise NotImplementedError("VoxtralRealtime uses a custom pipeline")
@@ -300,7 +362,13 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             )
             return fallback
 
-        def _emit_transcript(final: bool, text: str, start_time: float) -> None:
+        def _emit_transcript(
+            final: bool, text: str, start_time: float, lang: str | None = None
+        ) -> None:
+            # lang defaults to the segment's source language; translations pass
+            # the target code so main.py routes them to that BBB locale. All of
+            # a segment's events (original + translations) share start_time, so
+            # each lands on the right per-locale transcriptId for the same moment.
             self.emit(
                 "final_transcript" if final else "interim_transcript",
                 participant=participant,
@@ -313,7 +381,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     alternatives=[
                         stt.SpeechData(
                             text=text,
-                            language=language,
+                            language=lang if lang is not None else language,
                             start_time=start_time,
                             end_time=time.time() - open_time,
                         )
@@ -321,6 +389,41 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 ),
                 open_time=open_time,
             )
+
+        # Best-effort translation fan-out tasks; tracked so they are not GC'd
+        # mid-flight and can be cancelled at teardown.
+        translation_tasks: set[asyncio.Task] = set()
+
+        async def _translate_and_emit(text: str, start_time: float) -> None:
+            """Translate one finalized segment into every target language in a
+            single batch call, emitting a FINAL per successful target. Runs as
+            its own task so the HTTP round trip never blocks the reader; a
+            failed batch or per-pair error simply yields no FINAL for that
+            target and never affects the original or other targets."""
+            targets = self.config.translation_target_languages
+            item_id = f"{participant.identity}-{int(start_time * 1000)}"
+            try:
+                results = await self._translate_batch(
+                    [{"id": item_id, "text": text, "src": language, "tgts": targets}]
+                )
+            except Exception as e:
+                logging.warning(
+                    f"Voxtral: translation batch failed for {participant.identity} "
+                    f"segment {item_id} ({type(e).__name__}: {e}); "
+                    f"skipping {len(targets)} translation(s)"
+                )
+                return
+            for r in results:
+                if r.get("error") is not None:
+                    logging.debug(
+                        f"Voxtral: skipping {r.get('tgt')} translation for "
+                        f"{item_id}: {r['error']}"
+                    )
+                    continue
+                out_text = (r.get("text") or "").strip()
+                tgt = r.get("tgt")
+                if out_text and tgt:
+                    _emit_transcript(True, out_text, start_time, lang=tgt)
 
         # ── Reader ────────────────────────────────────────────────────────────
 
@@ -404,6 +507,20 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
                     if seg_text:
                         _emit_transcript(True, seg_text, seg_start)
+                        # Fan out translations of the finalized text. Capture
+                        # text/start now — they are reset immediately below and
+                        # the translation task runs later. The original FINAL is
+                        # always emitted above (no Gladia-style suppression);
+                        # empty segments never reach here, so none are fanned out.
+                        if (
+                            self.config.translation_enabled
+                            and self.config.translation_target_languages
+                        ):
+                            t = asyncio.create_task(
+                                _translate_and_emit(seg_text, seg_start)
+                            )
+                            translation_tasks.add(t)
+                            t.add_done_callback(translation_tasks.discard)
 
                     # Reset for next utterance
                     seg_text = ""
@@ -649,10 +766,22 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         try:
             await _writer()
             await _drain_reader()
+            # Let in-flight translations of the last segment(s) finish before
+            # teardown cancels them — otherwise a speaker leaving right after
+            # speaking loses that utterance's translations. Bounded and
+            # best-effort, mirroring _drain_reader for the original FINAL.
+            if translation_tasks:
+                await asyncio.wait(
+                    translation_tasks, timeout=_TRANSLATION_TIMEOUT_S + 0.1
+                )
         finally:
             reader_task.cancel()
             vad_task.cancel()
-            await asyncio.gather(reader_task, vad_task, return_exceptions=True)
+            for t in translation_tasks:
+                t.cancel()
+            await asyncio.gather(
+                reader_task, vad_task, *translation_tasks, return_exceptions=True
+            )
             await vad_stream.aclose()
             if segment_starts:
                 # Expected when teardown interrupts an open segment; anything

@@ -108,6 +108,10 @@ class TestVoxtralRealtimeConfig:
             "VOXTRAL_MODEL",
             "VOXTRAL_BASE_URL",
             "VOXTRAL_INTERIM_RESULTS",
+            "VOXTRAL_TRANSLATION_ENABLED",
+            "VOXTRAL_TRANSLATION_TARGET_LANGUAGES",
+            "VOXTRAL_TRANSLATION_SERVICE_URL",
+            "VOXTRAL_TRANSLATION_LANG_MAP",
         ]:
             monkeypatch.delenv(key, raising=False)
 
@@ -145,6 +149,27 @@ class TestVoxtralRealtimeConfig:
         monkeypatch.setenv("VOXTRAL_BASE_URL", "http://localhost:8000")
         assert VoxtralRealtimeConfig().base_url == "http://localhost:8000"
 
+    def test_translation_disabled_by_default(self):
+        assert VoxtralRealtimeConfig().translation_enabled is False
+
+    def test_translation_targets_empty_by_default(self):
+        assert VoxtralRealtimeConfig().translation_target_languages == []
+
+    def test_translation_service_url_none_by_default(self):
+        assert VoxtralRealtimeConfig().translation_service_url is None
+
+    def test_translation_lang_map_default_keys_are_iso_639_1(self):
+        m = VoxtralRealtimeConfig().translation_lang_map
+        assert m["de"] == "de-DE" and m["en"] == "en-US" and m["pt"] == "pt-BR"
+
+    def test_translation_targets_parsed_from_env(self, monkeypatch):
+        monkeypatch.setenv("VOXTRAL_TRANSLATION_TARGET_LANGUAGES", "en, es ,fr")
+        assert VoxtralRealtimeConfig().translation_target_languages == [
+            "en",
+            "es",
+            "fr",
+        ]
+
 
 # ── URL builder ────────────────────────────────────────────────────────────────
 
@@ -156,6 +181,20 @@ class TestBuildWsUrl:
         with pytest.raises(ValueError, match="VOXTRAL_BASE_URL"):
             VoxtralRealtimeSttAgent(
                 VoxtralRealtimeConfig(api_key="test-key", base_url=None),
+                vad=_make_mock_vad(),
+            )
+
+    def test_translation_enabled_without_service_url_raises(self):
+        """Fail at startup, not mid-meeting, if translation is on but the NMT
+        service URL is missing (mirrors the base_url fail-fast)."""
+        with pytest.raises(ValueError, match="VOXTRAL_TRANSLATION_SERVICE_URL"):
+            VoxtralRealtimeSttAgent(
+                VoxtralRealtimeConfig(
+                    api_key="test-key",
+                    base_url="https://server/v1",
+                    translation_enabled=True,
+                    translation_service_url=None,
+                ),
                 vad=_make_mock_vad(),
             )
 
@@ -1318,3 +1357,234 @@ class TestTeardownFlush:
             f"the tail segment's late transcription.done must still be read "
             f"before teardown, got {texts}"
         )
+
+
+# ── Translation fan-out (Option B: dedicated NMT service) ───────────────────────
+
+
+async def _wait_until(cond, timeout=2.0):
+    for _ in range(int(timeout / 0.01)):
+        if cond():
+            return True
+        await asyncio.sleep(0.01)
+    return cond()
+
+
+class TestTranslationFanout:
+    """Step-1 translation: on each original FINAL, one batched /translate_batch
+    call fans out into a FINAL per target language."""
+
+    def _make_translating_agent(self, batch_impl, targets=("en", "es")):
+        agent = _make_agent(
+            # START only: the writer opens on the first frame and the
+            # end-of-stream flush closes it. START+END from the mock VAD fires
+            # both before the frame's is_in_speech check, so the writer would
+            # never open and the opener-gated reader would deadlock.
+            vad_events=[_make_vad_event(agents_vad.VADEventType.START_OF_SPEECH)],
+            translation_enabled=True,
+            translation_service_url="http://nmt:8000",
+            translation_target_languages=list(targets),
+            interim_results=False,
+        )
+        agent._translate_batch = batch_impl
+        return agent
+
+    def _wire(self, agent, ws_messages, language="de"):
+        participant = MagicMock(spec=rtc.RemoteParticipant)
+        participant.identity = "user_tr"
+
+        sent: list[dict] = []
+
+        async def _send_json(data):
+            sent.append(data)
+            await asyncio.sleep(0)
+
+        def _opened():
+            return any(
+                m.get("type") == "input_audio_buffer.commit" and "final" not in m
+                for m in sent
+            )
+
+        # Deliver transcription events only after the writer has opened the
+        # segment (sent the opener commit) — the real server cannot emit a
+        # delta before it receives audio for an open request. This keeps the
+        # FIFO segment-start pairing exact instead of racing the writer.
+        closed = MagicMock()
+        closed.type = aiohttp.WSMsgType.CLOSED
+        script = [(lambda: True, _text_ws_msg({"type": "session.created"}))]
+        script += [(_opened, m) for m in ws_messages]
+        script_iter = iter(script)
+
+        async def _receive():
+            try:
+                cond, msg = next(script_iter)
+            except StopIteration:
+                return closed
+            while not cond():
+                await asyncio.sleep(0)
+            return msg
+
+        mock_ws = AsyncMock()
+        mock_ws.receive = _receive
+        mock_ws.send_json = _send_json
+        mock_session = MagicMock()
+        mock_session.ws_connect = MagicMock(return_value=_ws_context(mock_ws))
+        agent._http_session = mock_session
+
+        loud = _make_loud_frame()
+        mock_stream = AsyncMock()
+        mock_stream.__aiter__.return_value = iter([MagicMock(frame=loud)])
+        mock_stream.aclose = AsyncMock()
+        return participant, mock_stream, language
+
+    async def _run(self, agent, ws_messages, language="de"):
+        participant, mock_stream, language = self._wire(agent, ws_messages, language)
+        final = []
+        agent.on("final_transcript", lambda **kw: final.append(kw))
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await asyncio.wait_for(
+                agent._run_transcription_pipeline(participant, MagicMock(), language),
+                timeout=5.0,
+            )
+        return final
+
+    async def test_original_and_translations_emitted_with_shared_start(self):
+        batch = AsyncMock(
+            return_value=[
+                {"id": "x", "tgt": "en", "text": "Good day"},
+                {"id": "x", "tgt": "es", "text": "Buenos días"},
+            ]
+        )
+        agent = self._make_translating_agent(batch)
+        final = await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Guten Tag"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Guten Tag"}),
+            ],
+        )
+        await _wait_until(lambda: len(final) >= 3)
+
+        by_lang = {
+            kw["event"].alternatives[0].language: kw["event"].alternatives[0].text
+            for kw in final
+        }
+        # Original is always emitted (no Gladia-style suppression), plus a FINAL
+        # per target language.
+        assert by_lang == {"de": "Guten Tag", "en": "Good day", "es": "Buenos días"}
+        # All events of the segment share one start_time (same transcriptId
+        # second across per-locale tracks).
+        starts = {kw["event"].alternatives[0].start_time for kw in final}
+        assert len(starts) == 1
+
+    async def test_single_batched_call_for_all_targets(self):
+        batch = AsyncMock(return_value=[])
+        agent = self._make_translating_agent(batch, targets=("en", "es", "fr"))
+        await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Hallo"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Hallo"}),
+            ],
+        )
+        await _wait_until(lambda: batch.call_count >= 1)
+
+        assert batch.call_count == 1, "targets must be batched into ONE call"
+        items = batch.call_args[0][0]
+        assert len(items) == 1
+        assert items[0]["src"] == "de"
+        assert items[0]["text"] == "Hallo"
+        assert items[0]["tgts"] == ["en", "es", "fr"]
+
+    async def test_per_pair_error_skips_only_that_target(self):
+        batch = AsyncMock(
+            return_value=[
+                {"id": "x", "tgt": "en", "text": "Good day"},
+                {"id": "x", "tgt": "es", "error": "model pair unavailable"},
+            ]
+        )
+        agent = self._make_translating_agent(batch)
+        final = await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Guten Tag"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Guten Tag"}),
+            ],
+        )
+        await _wait_until(lambda: len(final) >= 2)
+        await asyncio.sleep(0.05)  # give a (non-existent) 3rd emit a chance
+
+        langs = {kw["event"].alternatives[0].language for kw in final}
+        assert langs == {"de", "en"}, "es failed → only its FINAL is skipped"
+
+    async def test_service_failure_keeps_original_final(self):
+        batch = AsyncMock(side_effect=TimeoutError("nmt slow"))
+        agent = self._make_translating_agent(batch)
+        final = await self._run(
+            agent,
+            [
+                _text_ws_msg({"type": "transcription.delta", "delta": "Guten Tag"}),
+                _text_ws_msg({"type": "transcription.done", "text": "Guten Tag"}),
+            ],
+        )
+        await _wait_until(lambda: len(final) >= 1)
+        await asyncio.sleep(0.05)
+
+        langs = [kw["event"].alternatives[0].language for kw in final]
+        assert langs == ["de"], "a failed batch must not crash or drop the original"
+
+    async def test_empty_segment_is_not_fanned_out(self):
+        batch = AsyncMock(return_value=[])
+        agent = self._make_translating_agent(batch)
+        final = await self._run(
+            agent,
+            # done with empty text and no deltas → no original FINAL to translate
+            [_text_ws_msg({"type": "transcription.done", "text": ""})],
+        )
+        await asyncio.sleep(0.05)
+
+        assert final == []
+        assert batch.call_count == 0, "empty segments must not hit the NMT service"
+
+
+class TestTranslateBatchHttp:
+    """The frozen HTTP contract: request shape and response parsing."""
+
+    class _FakePostCM:
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = AsyncMock(return_value=self._payload)
+            return resp
+
+        async def __aexit__(self, *a):
+            return False
+
+    async def test_posts_contract_request_and_parses_results(self):
+        agent = _make_agent(translation_service_url="http://nmt:8000/")
+        payload = {
+            "results": [
+                {"id": "seg-7", "tgt": "en", "text": "Good day", "latency_ms": 48},
+                {"id": "seg-7", "tgt": "es", "text": "Buenos días", "latency_ms": 52},
+            ]
+        }
+        session = MagicMock()
+        session.post = MagicMock(return_value=self._FakePostCM(payload))
+        agent._http_session = session
+
+        items = [
+            {"id": "seg-7", "text": "Guten Tag", "src": "de", "tgts": ["en", "es"]}
+        ]
+        results = await agent._translate_batch(items)
+
+        url = session.post.call_args[0][0]
+        body = session.post.call_args[1]["json"]
+        assert url == "http://nmt:8000/translate_batch"  # trailing slash collapsed
+        assert body == {"items": items}
+        assert [r["tgt"] for r in results] == ["en", "es"]
+        assert results[0]["text"] == "Good day"
