@@ -1,11 +1,16 @@
 """STT provider for vLLM's Voxtral Realtime WebSocket API.
 
-vLLM's protocol differs from the OpenAI Realtime Transcription API in three ways:
-- session.update: model is at the top level, not nested inside session.audio
+vLLM's protocol differs from the OpenAI Realtime Transcription API in four ways:
+- session.update: model is at the top level, not nested inside session.audio.
+  It is also the ONLY field vLLM reads — its handler does event.get("model")
+  and ignores the rest of the payload
+  (vllm/entrypoints/speech_to_text/realtime/connection.py, handle_event).
 - No server-side VAD: the client segments speech itself — a bare
   input_audio_buffer.commit opens a streaming request, commit(final: true)
   closes it (verified in notes/progressive-transcription-investigation.md)
 - Response events: transcription.delta / transcription.done (not conversation.item.*)
+- No language, in either direction. There is no field to request one and none
+  is reported back; see _vad_loop's `language` parameter for why.
 
 Audio must be PCM16, 16 kHz, mono, base64-encoded.
 """
@@ -54,6 +59,17 @@ _SPLIT_OVERLAP_S = float(os.getenv("VOXTRAL_SPLIT_OVERLAP_S", "1.5"))
 # Reconnect backoff bounds for a dropped WebSocket connection.
 _RETRY_DELAY_INITIAL_S = 1.0
 _RETRY_DELAY_MAX_S = 30.0
+# WebSocket ping interval. A half-open connection (server killed without a
+# FIN, idle NAT/load-balancer drop) leaves the reader blocked in receive()
+# indefinitely, so aiohttp has to detect the loss for us.
+_WS_HEARTBEAT_S = 20.0
+# How long to keep retrying a handshake that connects but answers with
+# something other than session.created. The budget has to outlast vLLM's
+# 2–5 min of CUDA-graph warmup, during which the server may reject or error on
+# the upgrade; past it, a handshake that still fails is a misconfiguration —
+# wrong URL, or a server that does not speak vLLM's realtime protocol — and no
+# amount of further retrying will fix it.
+_HANDSHAKE_GIVE_UP_S = 600.0
 # After the audio stream ends, wait up to this long for the server's
 # transcription.done of the final segment before tearing the reader down;
 # cancelling it immediately would drop the tail utterance's FINAL.
@@ -68,6 +84,33 @@ _FINAL_DRAIN_TIMEOUT_S = 3.0
 # the wait when a done never arrives (already-desynced session): give up,
 # resync the counter, and open ungated as before.
 _OPEN_GATE_TIMEOUT_S = float(os.getenv("VOXTRAL_OPEN_GATE_TIMEOUT_S", "10.0"))
+
+
+# Key under which the prewarmed VAD is stashed in the worker process's
+# userdata. Namespaced because the dict is shared with anything else the
+# process prewarms.
+VAD_USERDATA_KEY = "voxtral_realtime_vad"
+
+
+class _HandshakeError(Exception):
+    """The upgrade succeeded but the server did not answer with session.created."""
+
+
+def _load_vad() -> agents_vad.VAD:
+    return silero.VAD.load(
+        min_silence_duration=_VAD_MIN_SILENCE_S,
+        activation_threshold=_VAD_ACTIVATION_THRESHOLD,
+    )
+
+
+def prewarm(userdata: dict) -> None:
+    """Load the Silero model once per worker process, before any job arrives.
+
+    Called from the LiveKit worker's prewarm hook. Loading it lazily in the
+    agent constructor instead would run once per room, synchronously on the
+    job's event loop, and keep one copy of the model per concurrent job.
+    """
+    userdata[VAD_USERDATA_KEY] = _load_vad()
 
 
 @dataclass
@@ -107,10 +150,13 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 "(the URL of your vLLM server, e.g. https://your-server:8000/v1)."
             )
         self._http_session: aiohttp.ClientSession | None = None
-        self._vad: agents_vad.VAD = vad or silero.VAD.load(
-            min_silence_duration=_VAD_MIN_SILENCE_S,
-            activation_threshold=_VAD_ACTIVATION_THRESHOLD,
-        )
+        if vad is None:
+            # Normally supplied by prewarm(); loading here is the fallback for
+            # a worker started without the hook, and costs the job the model
+            # load on its own event loop.
+            logging.debug("Voxtral: no prewarmed VAD supplied, loading inline.")
+            vad = _load_vad()
+        self._vad: agents_vad.VAD = vad
 
     def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None:
@@ -124,7 +170,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         return f"{base}/realtime?intent=transcription"
 
-    def _create_stt_stream(self, locale: str) -> stt.SpeechStream:
+    def _create_stt_stream(self, locale: str | None) -> stt.SpeechStream:
         raise NotImplementedError("VoxtralRealtime uses a custom pipeline")
 
     def _update_stream_locale(self, user_id: str, locale: str):
@@ -174,47 +220,68 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             await self._http_session.close()
             self._http_session = None
 
-    async def _run_transcription_pipeline(
+    async def _run_transcription_pipeline(  # type: ignore[override]
         self,
         participant: rtc.RemoteParticipant,
         track: rtc.Track,
-        language: str,
+        language: str | None,
     ):
         ws_url = self._build_ws_url()
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        # A vLLM server started without VLLM_API_KEY takes anonymous requests,
+        # so an unset key means "send no credentials" — not "send the string
+        # None", which any auth proxy in front would reject outright.
+        headers = (
+            {"Authorization": f"Bearer {self.config.api_key}"}
+            if self.config.api_key
+            else {}
+        )
         open_time = time.time()
+        self.open_time = open_time
         retry_delay = _RETRY_DELAY_INITIAL_S
+        # Monotonic timestamp of the first handshake failure in the current
+        # streak; cleared whenever a handshake succeeds, so a long meeting with
+        # occasional reconnects never accumulates its way to the give-up bound.
+        handshake_failing_since: float | None = None
 
         try:
             while True:
                 audio_stream = rtc.AudioStream(track)
                 try:
                     async with self._get_http_session().ws_connect(
-                        ws_url, headers=headers
+                        ws_url, headers=headers, heartbeat=_WS_HEARTBEAT_S
                     ) as ws:
                         msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                         if msg.type != aiohttp.WSMsgType.TEXT:
-                            logging.error(
-                                "Voxtral WS: expected text for session.created"
+                            raise _HandshakeError(
+                                f"expected TEXT for session.created, got {msg.type}"
                             )
-                            return
-                        data = json.loads(msg.data)
+                        try:
+                            data = json.loads(msg.data)
+                        except (ValueError, TypeError) as e:
+                            raise _HandshakeError(
+                                f"malformed first message: {e}"
+                            ) from e
                         if data.get("type") != "session.created":
-                            logging.error(
-                                f"Voxtral WS: unexpected first message: {data}"
-                            )
-                            return
+                            raise _HandshakeError(f"unexpected first message: {data}")
                         logging.info(
                             f"Voxtral WS session created for {participant.identity}"
                         )
-                        # Connection is healthy again; reset reconnect backoff.
+                        # Connection is healthy again; reset reconnect backoff
+                        # and the handshake give-up streak.
                         retry_delay = _RETRY_DELAY_INITIAL_S
+                        handshake_failing_since = None
 
-                        # vLLM expects a FLAT session.update — model and
-                        # temperature at the top level; nesting under
-                        # "session" is rejected (probe test 6). The model
-                        # card mandates temperature 0.0: greedy decoding is
-                        # required for stable transcription.
+                        # vLLM expects a FLAT session.update: its handler
+                        # reads event.get("model") off the top level, so
+                        # nesting under "session" fails validation with
+                        # "Missing required field: model" (probe test 6).
+                        # model is also the only field it reads — the
+                        # SessionUpdate model declares nothing else, and the
+                        # server hardcodes temperature=0.0 for every realtime
+                        # generation, which is the greedy decoding the model
+                        # card requires. temperature is sent anyway: it is
+                        # ignored today and correct if the field is ever
+                        # honoured.
                         await ws.send_json(
                             {
                                 "type": "session.update",
@@ -230,11 +297,40 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
                 except asyncio.CancelledError:
                     raise
+                except _HandshakeError as e:
+                    # Retrying is what makes a server that is still warming up
+                    # survivable. Returning here instead would end this
+                    # participant's transcription for the rest of the meeting:
+                    # nothing re-arms the pipeline, because _on_track_subscribed
+                    # only fires for a track that is not already subscribed.
+                    now = time.monotonic()
+                    if handshake_failing_since is None:
+                        handshake_failing_since = now
+                    if now - handshake_failing_since >= _HANDSHAKE_GIVE_UP_S:
+                        logging.error(
+                            f"Voxtral WS handshake still failing for "
+                            f"{participant.identity} after "
+                            f"{_HANDSHAKE_GIVE_UP_S:.0f}s ({e}) — giving up. "
+                            f"Check that VOXTRAL_BASE_URL points at a vLLM "
+                            f"server serving the realtime API: {ws_url}"
+                        )
+                        return
+                    logging.warning(
+                        f"Voxtral WS handshake failed for {participant.identity} "
+                        f"({e}), retrying in {retry_delay:.0f}s"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, _RETRY_DELAY_MAX_S)
                 except (TimeoutError, aiohttp.ClientError, ConnectionResetError) as e:
                     # TimeoutError covers a slow session.created handshake —
                     # vLLM takes 2–5 min of CUDA-graph warmup after startup,
                     # during which giving up permanently would cost the
                     # participant the whole meeting. Retry with backoff.
+                    # Deliberately unbounded, unlike _HandshakeError: a
+                    # transport failure is as likely to be the server
+                    # restarting mid-meeting as a permanent misconfiguration,
+                    # and a reachable-but-silent endpoint costs one connect
+                    # attempt every _RETRY_DELAY_MAX_S.
                     logging.warning(
                         f"Voxtral WS connection lost for {participant.identity} "
                         f"({type(e).__name__}: {e}), reconnecting in {retry_delay:.0f}s"
@@ -270,9 +366,21 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         ws: aiohttp.ClientWebSocketResponse,
         audio_stream: rtc.AudioStream,
         participant: rtc.RemoteParticipant,
-        language: str,
+        language: str | None,
         open_time: float,
     ):
+        # `language` only labels the transcripts this pipeline emits; it is
+        # never sent to the server, because there is nowhere to send it. vLLM's
+        # SessionUpdate carries only `type` and `model`, and its realtime prompt
+        # is tokenizer.instruct.start() + audio_encoder.encode_streaming_tokens()
+        # — mistral_common encodes a "lang:<code>" prefix only in
+        # _encode_instruct_transcription, the offline format; the streaming one
+        # never reads request.language. Nothing comes back either:
+        # transcription.delta carries `delta` and transcription.done carries
+        # `text` and `usage`, neither a detected language. So Voxtral Realtime
+        # always auto-detects, this label is the locale the participant asked
+        # for, and "auto" (language None) means main.py has nothing to resolve a
+        # BBB locale from and drops the transcript. See the README's caveats.
         chunk_size = (
             _TARGET_SAMPLE_RATE // 20 * 2
         )  # 50 ms of int16 (matches official plugin)
@@ -293,6 +401,13 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         # showing the already-emitted interim as pending forever.
         seg_text = ""
         seg_start: float | None = None
+        # Text of the last INTERIM emitted for the in-flight segment. vLLM
+        # streams one transcription.delta per decoded frame and the frames that
+        # decode to nothing carry an empty delta, so a segment ends with a run
+        # of deltas that leave seg_text untouched — emitting on each of them
+        # republishes identical text under the same BBB transcriptId dozens of
+        # times per utterance.
+        last_interim = ""
 
         # Segments opened whose transcription.done has not been read yet.
         # Incremented by _writer._open(), decremented by _reader on done.
@@ -347,7 +462,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             emitted by the server while audio is still streaming are consumed
             in real time rather than buffered and replayed after each commit.
             """
-            nonlocal seg_text, seg_start, outstanding
+            nonlocal seg_text, seg_start, outstanding, last_interim
 
             while True:
                 try:
@@ -398,7 +513,12 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                             f"(seg_start={seg_start:.3f}s)"
                         )
                     seg_text += data.get("delta", "")
-                    if seg_text and self.config.interim_results:
+                    if (
+                        seg_text
+                        and seg_text != last_interim
+                        and self.config.interim_results
+                    ):
+                        last_interim = seg_text
                         _emit_transcript(False, seg_text, seg_start)
 
                 elif msg_type == "transcription.done":
@@ -427,6 +547,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     # Reset for next utterance
                     seg_text = ""
                     seg_start = None
+                    last_interim = ""
 
                 elif msg_type == "error":
                     logging.error(f"Voxtral WS error event: {data}")
@@ -650,10 +771,30 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                             # The done never arrived (lost closing commit or
                             # event desync); waiting longer only buffers more
                             # audio. Resync and open ungated on the next frame.
+                            #
+                            # Drop the starts still queued along with the
+                            # counter. A segment that streamed has already had
+                            # its start popped at its first delta, so what is
+                            # left belongs to the segments this timeout is
+                            # giving up on. Keeping them would pair every later
+                            # segment with its predecessor's start — a wrong
+                            # BBB transcriptId, for the life of the connection,
+                            # and silently: _pop_segment_start warns about an
+                            # empty queue, never an over-full one.
+                            #
+                            # The trade: a server merely slow past the timeout
+                            # still owes deltas for a start just discarded, so
+                            # that one segment falls back to a wall-clock stamp
+                            # — loudly, from _pop_segment_start. A first delta
+                            # arrives ~0.6 s after speech starts, so reaching
+                            # here means the segment is wedged, not slow.
+                            orphans = len(segment_starts)
+                            segment_starts.clear()
                             logging.warning(
                                 f"Voxtral: open gate timed out for "
                                 f"{participant.identity} with {outstanding} "
-                                f"transcription(s) outstanding — resyncing"
+                                f"transcription(s) outstanding — resyncing "
+                                f"(discarding {orphans} unpaired segment start(s))"
                             )
                             outstanding = 0
 

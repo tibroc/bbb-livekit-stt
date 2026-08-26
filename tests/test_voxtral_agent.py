@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -304,6 +305,26 @@ class TestStartTranscriptionForUser:
         assert mock_pipeline.call_args[0][2] == "pt"
         agent.processing_info.pop("user_1", None)
 
+    async def test_auto_locale_reaches_the_pipeline_as_none(self):
+        """
+        "auto" sanitizes to None, which is how a provider is told to detect the
+        language server-side. Voxtral never sends a language to vLLM, so the
+        None also means the emitted transcripts carry no language — see
+        test_auto_locale_emits_transcripts_with_no_language and the README's
+        note that "auto" is not usable with this provider.
+        """
+        participant = _make_participant("user_1")
+        agent = _make_agent_with_room(participants={"p1": participant})
+
+        with patch.object(
+            agent, "_run_transcription_pipeline", new_callable=AsyncMock
+        ) as mock_pipeline:
+            agent.start_transcription_for_user("user_1", "auto", "voxtral-realtime")
+            await asyncio.sleep(0)
+
+        assert mock_pipeline.call_args[0][2] is None
+        agent.processing_info.pop("user_1", None)
+
     async def test_settings_stored_on_start(self):
         participant = _make_participant("user_1")
         agent = _make_agent_with_room(participants={"p1": participant})
@@ -340,31 +361,63 @@ class TestCleanup:
 # ── _run_transcription_pipeline — early exit paths ────────────────────────────
 
 
+def _binary_ws_msg() -> MagicMock:
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.BINARY
+    return msg
+
+
+def _closed_ws_msg() -> MagicMock:
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.CLOSED
+    return msg
+
+
+def _raw_text_ws_msg(raw: str) -> MagicMock:
+    """A TEXT frame whose payload is not valid JSON."""
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.TEXT
+    msg.data = raw
+    return msg
+
+
+# A connection whose handshake succeeds; the reader then sees the socket close.
+_GOOD_HANDSHAKE = [_text_ws_msg({"type": "session.created"}), _closed_ws_msg()]
+
+
 class TestRunTranscriptionPipeline:
-    def _ws_context(self, first_message):
-        """Build an async context manager that yields a mock WS with one receive."""
+    @pytest.fixture(autouse=True)
+    def _no_backoff_sleeps(self, monkeypatch):
+        """Keep the reconnect backoff from adding real seconds to the suite."""
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._RETRY_DELAY_INITIAL_S", 0.0, raising=True
+        )
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._RETRY_DELAY_MAX_S", 0.0, raising=True
+        )
+
+    def _ws_context(self, messages):
+        """An async context manager yielding a WS that replays `messages`."""
         mock_ws = AsyncMock()
-        mock_ws.receive = AsyncMock(return_value=first_message)
+        mock_ws.receive = AsyncMock(side_effect=list(messages))
         mock_ws.send_json = AsyncMock()
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=mock_ws)
         cm.__aexit__ = AsyncMock(return_value=False)
         return cm
 
-    def _mock_session(self, first_message):
+    def _mock_session(self, *connections):
+        """One entry per expected ws_connect call, each a list of WS messages."""
         session = MagicMock()
-        session.ws_connect = MagicMock(return_value=self._ws_context(first_message))
+        session.ws_connect = MagicMock(
+            side_effect=[self._ws_context(msgs) for msgs in connections]
+        )
         return session
 
-    async def test_exits_cleanly_on_non_text_first_message(self, caplog):
-        agent = _make_agent()
+    async def _run(self, agent, *connections):
         participant = MagicMock(spec=rtc.RemoteParticipant)
         participant.identity = "user_1"
-
-        binary_msg = MagicMock()
-        binary_msg.type = aiohttp.WSMsgType.BINARY
-
-        agent._http_session = self._mock_session(binary_msg)
+        agent._http_session = self._mock_session(*connections)
 
         mock_stream = AsyncMock()
         mock_stream.__aiter__.return_value = iter([])
@@ -376,26 +429,76 @@ class TestRunTranscriptionPipeline:
             await agent._run_transcription_pipeline(participant, MagicMock(), "en")
 
         assert "user_1" not in agent.processing_info
+        return agent._http_session.ws_connect
 
-    async def test_exits_cleanly_on_wrong_first_message_type(self, caplog):
-        agent = _make_agent()
-        participant = MagicMock(spec=rtc.RemoteParticipant)
-        participant.identity = "user_1"
+    # --- Authorization header ---
 
-        agent._http_session = self._mock_session(
-            _text_ws_msg({"type": "session.error"})  # not "session.created"
+    async def _connect_once(self, agent, monkeypatch):
+        # Give up on the first bad handshake so the pipeline makes exactly one
+        # connection attempt and we can inspect its arguments.
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._HANDSHAKE_GIVE_UP_S", 0.0, raising=True
         )
+        ws_connect = await self._run(agent, [_binary_ws_msg()])
+        return ws_connect.call_args.kwargs["headers"]
 
-        mock_stream = AsyncMock()
-        mock_stream.__aiter__.return_value = iter([])
-        mock_stream.aclose = AsyncMock()
+    async def test_sends_bearer_header_when_api_key_is_set(self, monkeypatch):
+        headers = await self._connect_once(_make_agent(), monkeypatch)
+        assert headers["Authorization"] == "Bearer test-key"
 
-        with patch(
-            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
-        ):
-            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
+    async def test_omits_authorization_header_when_no_api_key(self, monkeypatch):
+        # Servers without VLLM_API_KEY take anonymous requests; sending
+        # "Bearer None" would be rejected by an auth proxy in front of them.
+        agent = VoxtralRealtimeSttAgent(
+            VoxtralRealtimeConfig(
+                api_key=None, base_url="https://test-server.example.com/v1"
+            ),
+            vad=_make_mock_vad(),
+        )
+        assert "Authorization" not in await self._connect_once(agent, monkeypatch)
 
-        assert "user_1" not in agent.processing_info
+    # --- Handshake failures are retried, not fatal ---
+    #
+    # Returning on a bad handshake would end transcription for the rest of the
+    # meeting: nothing re-arms the pipeline, since _on_track_subscribed only
+    # fires for a track that is not already subscribed.
+
+    async def test_retries_after_non_text_first_message(self):
+        ws_connect = await self._run(_make_agent(), [_binary_ws_msg()], _GOOD_HANDSHAKE)
+        assert ws_connect.call_count == 2
+
+    async def test_retries_after_wrong_first_message_type(self):
+        ws_connect = await self._run(
+            _make_agent(),
+            [_text_ws_msg({"type": "session.error"})],  # not "session.created"
+            _GOOD_HANDSHAKE,
+        )
+        assert ws_connect.call_count == 2
+
+    async def test_retries_after_malformed_first_message(self):
+        ws_connect = await self._run(
+            _make_agent(),
+            [_raw_text_ws_msg("<html>502 Bad Gateway</html>")],
+            _GOOD_HANDSHAKE,
+        )
+        assert ws_connect.call_count == 2
+
+    async def test_gives_up_once_the_handshake_budget_is_spent(
+        self, monkeypatch, caplog
+    ):
+        # A server that never speaks the protocol — wrong URL, or not vLLM.
+        # Retrying forever would hide the misconfiguration.
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._HANDSHAKE_GIVE_UP_S", 0.0, raising=True
+        )
+        with caplog.at_level(logging.ERROR):
+            ws_connect = await self._run(
+                _make_agent(), [_text_ws_msg({"type": "session.error"})]
+            )
+
+        assert ws_connect.call_count == 1
+        assert "giving up" in caplog.text
+        assert "VOXTRAL_BASE_URL" in caplog.text
 
 
 # ── _vad_loop — speech detection and final flush ──────────────────────────────
@@ -524,6 +627,71 @@ class TestVadLoop:
         assert len(interim) >= 1
         assert interim[0]["event"].type == stt.SpeechEventType.INTERIM_TRANSCRIPT
         assert len(final) == 1
+
+    async def test_empty_deltas_do_not_reemit_the_same_interim(self):
+        """
+        Deltas carrying no text must not re-emit the previous interim.
+
+        vLLM streams one transcription.delta per decoded frame, and the frames
+        after the last word of a segment carry an empty delta until the segment
+        closes. Emitting on each of them republishes identical text under the
+        same BBB transcriptId dozens of times per utterance.
+        """
+        loud = _make_loud_frame()
+        agent, participant, mock_stream = self._full_pipeline_setup(
+            audio_frames=[loud],
+            ws_messages=[
+                _text_ws_msg({"type": "transcription.delta", "delta": "hi"}),
+                _text_ws_msg({"type": "transcription.delta", "delta": ""}),
+                _text_ws_msg({"type": "transcription.delta", "delta": ""}),
+                _text_ws_msg({"type": "transcription.done", "text": "hi"}),
+            ],
+        )
+
+        interim = []
+        agent.on("interim_transcript", lambda **kw: interim.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
+        await asyncio.sleep(0)
+
+        texts = [kw["event"].alternatives[0].text for kw in interim]
+        assert texts == ["hi"], f"expected one interim per text change, got {texts}"
+
+    async def test_auto_locale_emits_transcripts_with_no_language(self):
+        """
+        Under "auto" the provider has no language to report: vLLM is never told
+        which one to expect (session.update carries only model and temperature)
+        and nothing reads a detected one back. main.py then has no BBB locale to
+        publish under and discards the transcript, which is why the README tells
+        users to set an explicit locale with this provider.
+        """
+        loud = _make_loud_frame()
+        agent, participant, mock_stream = self._full_pipeline_setup(
+            audio_frames=[loud],
+            ws_messages=[
+                _text_ws_msg({"type": "transcription.delta", "delta": "hallo"}),
+                _text_ws_msg({"type": "transcription.done", "text": "hallo"}),
+            ],
+        )
+
+        interim = []
+        final = []
+        agent.on("interim_transcript", lambda **kw: interim.append(kw))
+        agent.on("final_transcript", lambda **kw: final.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await agent._run_transcription_pipeline(participant, MagicMock(), None)
+        await asyncio.sleep(0)
+
+        assert len(final) == 1
+        assert final[0]["event"].alternatives[0].language is None
+        assert interim, "expected at least one interim to check as well"
+        assert all(kw["event"].alternatives[0].language is None for kw in interim)
 
     async def test_two_utterances_emit_two_finals_with_independent_text(self):
         """
@@ -1276,6 +1444,80 @@ class TestCommitGate:
         assert "open gate timed out" in caplog.text
         assert len(self._openers(sent)) >= 2, (
             "after the gate timeout the next segment must still open"
+        )
+
+    async def test_gate_timeout_discards_the_unpaired_segment_start(self, monkeypatch):
+        """
+        The gate timeout must drop the starts of the segments it gave up on.
+
+        The timeout exists for a commit vLLM silently ignored: that segment
+        produces neither a delta nor a done, so its queued start is never
+        popped. Resyncing `outstanding` without draining the queue leaves the
+        start behind, and the next segment — and every one after it, for the
+        life of the connection — is stamped with its predecessor's start time,
+        which is the BBB transcriptId. Nothing logs it: _pop_segment_start
+        warns on an empty queue, never an over-full one.
+
+        The clock is faked at 10 s per reading so the two candidate stamps are
+        far apart: the dropped segment's start is one step after open_time
+        (~10 s), the segment that actually streams is several steps later.
+        """
+        import providers.voxtral_realtime as vr
+
+        monkeypatch.setattr(vr, "_MAX_BUFFER_DURATION_S", 0.015)
+        monkeypatch.setattr(vr, "_OPEN_GATE_TIMEOUT_S", 0.0)
+
+        clock = [0.0]
+
+        def _fake_time():
+            clock[0] += 10.0
+            return clock[0]
+
+        monkeypatch.setattr(vr.time, "time", _fake_time)
+
+        vad_stream = _ScheduledVadStream([(1, agents_vad.VADEventType.START_OF_SPEECH)])
+        mock_vad = MagicMock()
+        mock_vad.stream.return_value = vad_stream
+        agent = VoxtralRealtimeSttAgent(_make_config(), vad=mock_vad)
+
+        frames = [_make_audio_frame(amplitude=100 + i) for i in range(8)]
+        # No transcription events for the first segment — its opener was
+        # dropped. Both events arrive only once a second segment has opened.
+        script = [
+            (lambda: True, _text_ws_msg({"type": "session.created"}), False),
+            (
+                lambda: len(self._openers(sent)) >= 2,
+                _text_ws_msg({"type": "transcription.delta", "delta": "hi"}),
+                False,
+            ),
+            (
+                lambda: len(self._openers(sent)) >= 2,
+                _text_ws_msg({"type": "transcription.done", "text": "hi"}),
+                False,
+            ),
+        ]
+        participant, mock_stream, sent = self._wire(agent, frames, script)
+
+        final = []
+        agent.on("final_transcript", lambda **kw: final.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream",
+            return_value=mock_stream,
+        ):
+            await asyncio.wait_for(
+                agent._run_transcription_pipeline(participant, MagicMock(), "en"),
+                timeout=5.0,
+            )
+        await asyncio.sleep(0)
+
+        assert len(self._openers(sent)) >= 2, "the gate timeout must still reopen"
+        assert len(final) == 1
+        start_time = final[0]["event"].alternatives[0].start_time
+        assert start_time > 10.0, (
+            f"the streaming segment was stamped {start_time:.1f}s, the start "
+            f"queued for the segment the gate gave up on — the resync must "
+            f"discard unpaired segment starts, not just the counter"
         )
 
 

@@ -165,9 +165,21 @@ VOXTRAL_API_KEY=your-key                            # if your server enforces on
 VAD and segmentation tuning options (silence duration, pre-roll, split
 overlap, max segment length) are documented in `.env.example`.
 
-> **Note**: Voxtral Realtime does not support real-time translation. Only the
-> original transcript language is returned, matching the user's BBB speech
-> locale.
+Some caveats apply to this provider:
+
+- It does not support real-time translation. Only the original transcript
+  language is returned, matching the user's BBB speech locale.
+- The `auto` speech locale is not usable with it, and the participant's chosen
+  locale never reaches the model either. vLLM's realtime API carries no language
+  in either direction: `session.update` accepts only `model`, and
+  `transcription.delta` / `transcription.done` report only text. The limitation
+  is in the model's streaming prompt format, not just the API — a target
+  language is encoded as a `lang:<code>` prefix only in the offline
+  transcription format, never in the streaming one. Voxtral Realtime therefore
+  always detects the language itself, transcripts are labelled with the locale
+  the participant selected, and under `auto` there is no language at all, so
+  every transcript — interim and final — is discarded with a warning. Set an
+  explicit locale in BBB when using Voxtral Realtime STT.
 
 ### Development
 
